@@ -1,11 +1,10 @@
-name: "Minecraft Vanilla Dedicated Server"
+name: "Minecraft Java Server"
 slug: minecraft_vanilla_server
 description: >
-  Minecraft Vanilla Dedicated Server for Home Assistant OS.
-  Automatically installs Java, accepts the Minecraft EULA,
-  downloads the selected server version and stores all data
-  persistently in /share.
-version: "0.0.2"
+  A configurable Java server for Home Assistant with vanilla, popular server
+  software, and Modrinth or CurseForge modpack support.
+version: "1.0.0"
+url: https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server
 
 arch:
   - amd64
@@ -13,35 +12,57 @@ arch:
 
 startup: application
 boot: auto
-init: false
-host_network: false
+timeout: 120
+backup: cold
+breaking_versions:
+  - "1.0.0"
 
-# Container läuft IMMER auf 25565
-# Der Host-Port kann im HA UI geändert werden
 ports:
-  25565/tcp: 25565
+  "25565/tcp": 25565
 ports_description:
-  25565/tcp: "Minecraft server port (container fixed to 25565)"
+  "25565/tcp": "Minecraft Java server (change the host port in the Network tab)"
 
 map:
-  - share:rw
+  - type: share
+    read_only: false
 
 options:
-  data_dir: "/share/minecraft-vanilla"
-
-  # RAM (MB)
+  eula: false
+  server_type: VANILLA
+  mc_version: LATEST
+  java_version: auto
+  modpack: ""
   xms_mb: 1024
   xmx_mb: 4096
-
-  # "latest" oder z.B. "1.21.1"
-  mc_version: "latest"
-
-  # Optional: feste Server-JAR URL (überschreibt mc_version)
+  data_dir: "/share/minecraft-vanilla"
+  motd: "A Minecraft Server"
+  max_players: 20
+  difficulty: normal
+  game_mode: survival
+  online_mode: true
+  pvp: true
+  view_distance: 10
+  simulation_distance: 10
+  allow_flight: false
   server_jar_url: ""
 
 schema:
-  data_dir: str
-  xms_mb: int
-  xmx_mb: int
-  mc_version: str
-  server_jar_url: str?
+  eula: bool
+  server_type: list(VANILLA|PAPER|PURPUR|FABRIC|FORGE|NEOFORGE|QUILT|MODRINTH|AUTO_CURSEFORGE|CUSTOM)
+  mc_version: str(1,40)
+  java_version: list(auto|17|21|25)
+  modpack: str
+  curseforge_api_key: password?
+  xms_mb: int(512,131072)
+  xmx_mb: int(512,131072)
+  data_dir: str(1,255)
+  motd: str(1,120)
+  max_players: int(1,1000)
+  difficulty: list(peaceful|easy|normal|hard)
+  game_mode: list(survival|creative|adventure|spectator)
+  online_mode: bool
+  pvp: bool
+  view_distance: int(2,32)
+  simulation_distance: int(2,32)
+  allow_flight: bool
+  server_jar_url: str

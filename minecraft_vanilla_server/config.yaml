@@ -12,7 +12,7 @@ arch:
 
 startup: application
 boot: auto
-timeout: 120
+timeout: 300
 backup: cold
 breaking_versions:
   - "1.0.0"

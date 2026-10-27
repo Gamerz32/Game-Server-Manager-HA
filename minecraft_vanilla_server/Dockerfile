@@ -1,23 +1,13 @@
-FROM ghcr.io/hassio-addons/debian-base:stable
+FROM ghcr.io/itzg/minecraft-server:latest
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
-
+# The upstream image provides the Minecraft runtime and launchers. jq is used
+# only to translate Home Assistant's /data/options.json into those settings.
+USER root
 RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    jq \
-    bash \
-    coreutils \
-    sed \
-    grep \
-    findutils \
-    tar \
-    xz-utils \
-  && apt-get clean \
-  && rm -rf /var/lib/apt/lists/*
+    && apt-get install -y --no-install-recommends jq \
+    && rm -rf /var/lib/apt/lists/*
 
 COPY run.sh /run.sh
-RUN chmod +x /run.sh
+RUN chmod 0755 /run.sh
 
-CMD ["/run.sh"]
+ENTRYPOINT ["/run.sh"]

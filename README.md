@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/cyclemat/Home-Assistant-Gameservers-ADDONS/main/assets/banner.png" alt="Home Assistant Game Servers Add-ons" width="80%">
+  <img src="https://raw.githubusercontent.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/main/assets/banner.png" alt="Home Assistant Game Servers Add-ons" width="80%">
 </p>
 
 <h1 align="center">🎮 Home Assistant Game Servers Add-ons</h1>
@@ -26,7 +26,7 @@ The goal is simple:
 All add-ons are designed to be:
 - 🔹 Easy to install
 - 🔹 Fully automated
-- 🔹 Persistent (data stored in `/share`)
+- 🔹 Persistent (data retained by Home Assistant across restarts)
 - 🔹 Safe to update & rebuild
 - 🔹 Suitable for 24/7 home servers
 
@@ -48,12 +48,12 @@ Benefits:
 ## 📦 Available Game Server Add-ons
 
 Each game server is provided as its own Home Assistant add-on with:
-- SteamCMD integration
+- Server-specific setup and launch automation
 - Persistent data storage
-- Automatic updates (optional)
-- Clean startup & shutdown handling
+- Clean startup and shutdown handling
 
 Examples:
+- ⛏️ Minecraft Java Server (vanilla, server software, and modpacks)
 - 🛡️ Valheim Dedicated Server
 - 🧟 Palworld Dedicated Server
 - 🚀 StarRupture Dedicated Server  
@@ -66,7 +66,7 @@ Examples:
 You can add this repository directly to your **Home Assistant Add-on Store**:
 
 ### 👉 Add Repository
-https://github.com/cyclemat/Home-Assistant-Gameservers-ADDONS
+https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS
 
 
 In Home Assistant:
@@ -110,7 +110,7 @@ Just open-source and passion ❤️
 ---
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/cyclemat/Home-Assistant-Gameservers-ADDONS/main/assets/logo.png" width="200">
+  <img src="https://raw.githubusercontent.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/main/assets/logo.png" width="200">
 </p>
 
 <p align="center">

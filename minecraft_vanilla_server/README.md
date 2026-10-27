@@ -1,120 +1,69 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/cyclemat/Home-Assistant-Gameservers-ADDONS/main/minecraft_vanilla_server/banner.png" alt="Minecraft Vanilla Dedicated Server Home Assistant Add-on" width="100%">
-</p>
+# Minecraft Java Server for Home Assistant
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Platform-Home%20Assistant-00bcd4.svg">
-  <img src="https://img.shields.io/badge/Type-Add--on-yellow.svg">
-  <img src="https://img.shields.io/badge/AMD64-Tested-yellow.svg">
-  <img src="https://img.shields.io/badge/ARM64-Untested-red.svg">
-  <img src="https://img.shields.io/badge/Status-Beta-orange.svg">
-</p>
+A Home Assistant add-on for Java Edition servers. It uses the maintained itzg/minecraft-server runtime and exposes the main server settings through the Home Assistant add-on Configuration tab.
 
----
+## Features
 
-<h1>Minecraft Vanilla Dedicated Server</h1>
+- Vanilla, Paper, Purpur, Fabric, Forge, NeoForge, and Quilt server software
+- Modrinth modpacks by slug, ID, project or version URL, or .mrpack URL
+- Automatically managed CurseForge modpacks by project URL or slug
+- Custom server JAR URLs
+- Java auto, 17, 21, or 25
+- Minecraft version, initial and maximum memory, MOTD, player limit, difficulty, game mode, account verification, PvP, and world distances configured in Home Assistant
+- Persistent worlds in the add-on's private storage
+- Graceful stop and cold Home Assistant backups
 
-This Home Assistant Add-on allows you to run a **Minecraft Vanilla Dedicated Server**
-directly on **Home Assistant OS**, fully managed by the Supervisor.
+The first installation builds its image on the Home Assistant device. This can take a while, especially on a small device. The base runtime supports amd64 and aarch64.
 
-It is designed to be:
+## Install
 
-- simple
-- headless
-- reproducible
-- configurable via the Home Assistant UI
-- suitable for LAN and private servers
+1. In Home Assistant, open Settings → Apps → App Store (called Add-on Store in older Home Assistant releases).
+2. Open the menu and choose Repositories.
+3. Add https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS.
+4. Install Minecraft Java Server.
+5. Open its Configuration tab and review the settings.
+6. Read the Minecraft EULA at https://aka.ms/MinecraftEULA, enable Accept the Minecraft EULA, save, then start the app.
 
----
+## Configure a standard server
 
-## ✨ Features
+The defaults run a current vanilla release with 1 GB initial and 4 GB maximum Java memory. The auto option follows the Java runtime bundled with the latest upstream server image; it currently uses Java 25. Auto does not inspect a selected game version or modpack and switch to an older runtime. Select Java 17 or 21 when an older version or pack requires it. Some pre-1.18 Forge packs require Java 8 and are outside this add-on's supported Java choices. The required runtime is set by the Minecraft version, loader, and pack.
 
-- Automatic **Java installation** (Temurin)
-- Automatic **Minecraft server download**
-- **EULA is always accepted automatically**
-- Fixed **container port 25565** (host port configurable via HA UI)
-- Configurable **RAM settings** (`Xms` / `Xmx`)
-- Persistent server data stored in `/share`
-- Live Minecraft server output in the Home Assistant add-on log
-- Additional persistent log file
-- Runs fully inside **Home Assistant OS**
-- No external server or launcher required
+The Minecraft container port stays at 25565. To change the host port, open the app's Network settings in Home Assistant. Forward the selected host port on your router only if players outside your home network need to connect.
 
----
+## Configure a modpack
 
-## 📂 Server Files Location
+### Modrinth
 
-All server files are stored persistently in:
+- Set Server software or modpack platform to MODRINTH.
+- Enter a Modrinth project slug, project ID, project URL, version URL, or hosted .mrpack URL in Modpack.
+- To pin a version, use the URL for that specific version.
 
-/share/minecraft-vanilla/
-├── server.jar
-├── world/
-├── logs/
-└── .jre/
+### CurseForge
 
-You can freely edit:
-- `server.properties`
-- worlds
-- logs
-- and other vanilla configuration files
+- Set Server software or modpack platform to AUTO_CURSEFORGE.
+- Enter the modpack URL or slug in Modpack.
+- The upstream Java 17+ image includes a CurseForge API key. If CurseForge rate-limits requests, add your own key in CurseForge API key.
 
----
+Only modpacks with server files or server-install support can run as dedicated servers. The selected Java version and memory must also meet the pack's requirements.
 
-## 🔧 Installation
+## Existing vanilla add-on users
 
-1. Open **Home Assistant**
-2. Go to **Settings → Add-ons → Add-on Store**
-3. Add this repository if not already added:
+Version 1.0.0 changes the server runtime and moves data from the old shared folder into the add-on's persistent private storage. On first start, the app copies files from /share/minecraft-vanilla (or the configured Previous add-on data folder) if it finds an old server. It keeps the original folder untouched as a backup. If it finds conflicting files in the destination, it stops and asks you to resolve the conflict instead of overwriting anything.
 
-https://github.com/cyclemat/Home-Assistant-Gameservers-ADDONS
+The EULA checkbox starts disabled. Review it and enable it before starting, including when upgrading an existing server.
 
-4. Install **Minecraft Vanilla Dedicated Server**
-5. Configure the add-on
-6. Start the server
+## Settings
 
----
+| Setting | Purpose |
+| --- | --- |
+| server_type | Server software, modpack platform, or custom JAR mode |
+| mc_version | LATEST, a release such as 1.21.1, or a supported snapshot |
+| java_version | auto, 17, 21, or 25 |
+| modpack | Modrinth project/version reference or CurseForge project reference |
+| xms_mb / xmx_mb | Initial and maximum Java memory |
+| motd, max_players | Server list message and player limit |
+| difficulty, game_mode, online_mode, pvp | Common server properties |
+| view_distance, simulation_distance | World rendering and simulation distances |
+| server_jar_url | Custom server JAR URL when using CUSTOM |
 
-## ⚙️ Configuration Options
-
-| Option | Description |
-|-----|------------|
-| `mc_version` | `latest` or a specific Minecraft version (e.g. `1.21.1`) |
-| `server_jar_url` | Optional custom server JAR URL |
-| `xms_mb` | Minimum RAM (MB) |
-| `xmx_mb` | Maximum RAM (MB) |
-
-> ℹ️ The Minecraft server always runs on port **25565 inside the container**.  
-> The external port can be changed in the Home Assistant add-on network settings.
-
----
-
-## 🧪 Architecture & Status
-
-- **amd64**: tested and working
-- **arm64**: should work, but **not yet fully tested**
-
-ARM64 support is implemented (Java + server are architecture-aware),
-but real-world feedback is highly appreciated.
-
-👉 If you are running this add-on on **ARM64 hardware**
-(e.g. Home Assistant Green, Raspberry Pi 64-bit),
-please consider testing it and sharing your results.
-
----
-
-## ❤️ Feedback & Support
-
-This add-on is developed and maintained in my free time.
-
-If you try it out:
-- feedback
-- bug reports
-- improvement suggestions
-- ARM64 test results
-
-are very welcome and highly appreciated.
-
----
-
-> **“Every block placed is a step into your own story.”**  
-> *— inspired by Minecraft*
+Use the Home Assistant app log for live server output. World, configuration, and downloaded server files remain in the app's persistent data folder and are included in Home Assistant backups.

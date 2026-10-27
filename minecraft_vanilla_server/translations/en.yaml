@@ -1,0 +1,54 @@
+configuration:
+  eula:
+    name: Accept the Minecraft EULA
+    description: Review the EULA at https://aka.ms/MinecraftEULA and enable this before starting the server.
+  server_type:
+    name: Server software or modpack platform
+    description: Choose vanilla, a server implementation, a Modrinth or CurseForge pack, or a custom JAR.
+  mc_version:
+    name: Minecraft version
+    description: Use LATEST for the newest supported release, or enter a specific version or snapshot.
+  java_version:
+    name: Java version
+    description: Auto follows the Java bundled with the latest upstream image (currently Java 25); it does not switch to an older runtime automatically. Select Java 17 or 21 when the selected Minecraft version, loader, or pack requires it.
+  modpack:
+    name: Modpack
+    description: Modrinth accepts a slug, ID, project or version URL, or .mrpack URL. CurseForge accepts a project URL or slug.
+  curseforge_api_key:
+    name: CurseForge API key
+    description: Optional. The current Java 17+ image includes an upstream key; supply your own if CurseForge rate limits downloads.
+  xms_mb:
+    name: Initial memory (MB)
+    description: Java heap memory allocated at startup.
+  xmx_mb:
+    name: Maximum memory (MB)
+    description: Maximum Java heap memory. Must be at least the initial memory value.
+  data_dir:
+    name: Previous add-on data folder
+    description: Existing /share path from the older vanilla add-on. It is copied once to persistent app storage and left in place as a backup.
+  motd:
+    name: Server list message
+    description: Text shown under the server name in the Minecraft multiplayer list.
+  max_players:
+    name: Maximum players
+    description: Maximum number of players allowed at once.
+  difficulty:
+    name: Difficulty
+  game_mode:
+    name: Default game mode
+  online_mode:
+    name: Verify player accounts
+    description: Keep enabled for normal authenticated Minecraft accounts.
+  pvp:
+    name: Player versus player
+  view_distance:
+    name: View distance
+    description: Lower this to reduce RAM and CPU use.
+  simulation_distance:
+    name: Simulation distance
+    description: Lower this to reduce server load.
+  allow_flight:
+    name: Allow flight
+  server_jar_url:
+    name: Custom server JAR URL
+    description: Backward-compatible option for a custom server JAR. Select CUSTOM to use it.

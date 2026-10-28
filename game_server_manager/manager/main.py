@@ -399,7 +399,7 @@ def env_for_server(item: dict[str, Any]) -> dict[str, str]:
             continue
         project = str(mod.get("project_id", ""))
         version_id = str(mod.get("version_id", ""))
-        loader_prefix = str(item.get("mod_loader", "")).lower()
+        loader_prefix = server_mod_loader(item).lower()
         if loader_prefix in {"fabric", "forge", "neoforge", "quilt"}:
             project = f"{loader_prefix}:{project}"
         if version_id:
@@ -1060,7 +1060,7 @@ def _compatible_modrinth_version(version: dict[str, Any], game_version: str, loa
 
 def provider_update(item: dict[str, Any], platform: str, project_id: str, current_id: str, kind: str) -> dict[str, Any] | None:
     game_version = str(item.get("minecraft_version", "LATEST"))
-    loader = str(item.get("mod_loader", "")).lower()
+    loader = server_mod_loader(item).lower()
     try:
         if platform == "modrinth":
             response = httpx.get(
@@ -1362,10 +1362,24 @@ def modrinth_headers() -> dict[str, str]:
 
 
 
+def canonical_mod_loader(value: Any) -> str:
+    normalized = str(value or "").strip().lower().replace("_", "").replace("-", "")
+    return {"fabric": "FABRIC", "forge": "FORGE", "neoforge": "NEOFORGE", "quilt": "QUILT"}.get(normalized, "")
+
+
+def server_mod_loader(item: dict[str, Any]) -> str:
+    # Older saved configs can have a lowercase or missing mod_loader field.
+    # The native server type is authoritative for standalone loader installs.
+    return canonical_mod_loader(item.get("mod_loader")) or canonical_mod_loader(item.get("server_type"))
+
+
 def mod_compatibility(game_version: str, loader: str, game_versions: list[str], loaders: list[str]) -> bool | None:
-    if not game_version or not loader:
+    selected_loader = canonical_mod_loader(loader)
+    if not game_version or not selected_loader:
         return None
-    return game_version in game_versions and loader.lower() in {str(value).lower() for value in loaders}
+    games = {str(value).strip().casefold() for value in game_versions}
+    supported_loaders = {canonical_mod_loader(value) for value in loaders}
+    return str(game_version).strip().casefold() in games and selected_loader in supported_loaders
 
 
 async def minecraft_manifest() -> dict[str, Any]:
@@ -1550,7 +1564,7 @@ async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: i
         response.raise_for_status()
         data = response.json()
     game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""
-    loader = str(item.get("mod_loader", "")).lower()
+    loader = server_mod_loader(item).lower()
     hits = []
     for project in data.get("hits", []):
         games = [str(v) for v in project.get("versions", [])]
@@ -1575,7 +1589,7 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
         response.raise_for_status()
         data = response.json()
     game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""
-    loader_id = CF_LOADER_IDS.get(str(item.get("mod_loader", "")).upper())
+    loader_id = CF_LOADER_IDS.get(server_mod_loader(item))
     hits = []
     for project in data.get("data", []):
         indexes = project.get("latestFilesIndexes", []) or []
@@ -1963,7 +1977,7 @@ async def add_mod(server_id: str, payload: dict[str, Any]):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
-    if item.get("mod_loader") not in MOD_LOADERS:
+    if server_mod_loader(item) not in MOD_LOADERS:
         raise HTTPException(status_code=409, detail="Choose a compatible mod loader or modpack in the Types tab before adding mods.")
     if item.get("updating"):
         raise HTTPException(status_code=409, detail="The server is updating.")
@@ -1982,7 +1996,7 @@ async def add_mod(server_id: str, payload: dict[str, Any]):
         raise HTTPException(status_code=422, detail="CurseForge file ID is invalid.")
     game_version = await resolve_minecraft_version(item)
     try:
-        await validate_mod_version(platform, project_id, version_id, file_id, game_version, str(item.get("mod_loader", "")).lower())
+        await validate_mod_version(platform, project_id, version_id, file_id, game_version, server_mod_loader(item).lower())
     except httpx.HTTPStatusError as err:
         raise HTTPException(status_code=502, detail=f"{platform.title()} returned HTTP {err.response.status_code} while checking mod compatibility.")
     except httpx.HTTPError as err:
@@ -2188,7 +2202,7 @@ async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", of
     item = read_json(config_path(server_id)) if server_id else {"minecraft_version": "LATEST", "mod_loader": ""}
     if server_id and not item:
         raise HTTPException(status_code=404, detail="Server not found.")
-    if kind == "mod" and item.get("mod_loader") not in MOD_LOADERS:
+    if kind == "mod" and server_mod_loader(item) not in MOD_LOADERS:
         raise HTTPException(status_code=409, detail="Select a mod loader such as Fabric or Forge in Types before browsing mods.")
     if kind == "plugin" and str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
         raise HTTPException(status_code=409, detail="Select Bukkit, Paper, or Purpur in Types before browsing plugins.")
@@ -2218,7 +2232,7 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
     if kind == "plugin" and str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
         raise HTTPException(status_code=409, detail="Select Bukkit, Paper, or Purpur in Types before browsing plugins.")
     game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""
-    loader = str(item.get("mod_loader", "")).lower()
+    loader = server_mod_loader(item).lower()
     try:
         if platform == "modrinth":
             async with httpx.AsyncClient(timeout=20, headers=modrinth_headers()) as client:

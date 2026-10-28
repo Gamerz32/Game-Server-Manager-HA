@@ -2,7 +2,7 @@ name: "Minecraft Server Manager"
 slug: minecraft_vanilla_server
 description: >
   Manage multiple Minecraft Java servers, Vanilla, modpacks, mods, and Bukkit-compatible plugins from a Home Assistant dashboard.
-version: "2.3.4"
+version: "2.3.5"
 url: https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server
 
 arch:

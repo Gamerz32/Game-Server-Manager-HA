@@ -1581,7 +1581,7 @@ async def lifespan(app: FastAPI):
         LOG.exception("Failed while stopping managed Minecraft servers")
 
 
-app = FastAPI(title="Minecraft Server Manager", lifespan=lifespan)
+app = FastAPI(title="Game Server Manager", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 

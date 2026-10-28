@@ -595,8 +595,9 @@ async def validate_mod_version(platform: str, project_id: str, version_id: str, 
     raise HTTPException(status_code=422, detail="Unsupported mod platform.")
 
 
-async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: int) -> dict[str, Any]:
-    params = {"query": query, "facets": json.dumps([[f"project_type:{kind}"]]), "limit": 24, "offset": offset, "index": "downloads"}
+async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: int, sort: str) -> dict[str, Any]:
+    index = {"downloads": "downloads", "updated": "updated"}[sort]
+    params = {"query": query, "facets": json.dumps([[f"project_type:{kind}"]]), "limit": 24, "offset": offset, "index": index}
     async with httpx.AsyncClient(timeout=20, headers=modrinth_headers()) as client:
         response = await client.get(f"{MODRINTH_BASE}/search", params=params)
         response.raise_for_status()
@@ -614,11 +615,13 @@ async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: i
     return {"hits": hits, "total_hits": data.get("total_hits", 0)}
 
 
-async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset: int) -> dict[str, Any]:
+async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset: int, sort: str) -> dict[str, Any]:
     key = settings().get("curseforge_api_key", "").strip()
     if not key:
         raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
-    params = {"gameId": MC_GAME_ID, "classId": CF_CLASS_IDS[kind], "searchFilter": query, "index": offset, "pageSize": 24}
+    sort_field = 6 if sort == "downloads" else 3
+    params = {"gameId": MC_GAME_ID, "classId": CF_CLASS_IDS[kind], "searchFilter": query, "index": offset,
+        "pageSize": 24, "sortField": sort_field, "sortOrder": "desc"}
     async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
         response = await client.get(f"{CURSEFORGE_BASE}/mods/search", params=params)
         response.raise_for_status()
@@ -1031,18 +1034,20 @@ async def minecraft_versions(channel: str = "all"):
 
 
 @app.get("/api/catalog")
-async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", offset: int = 0):
+async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", offset: int = 0, sort: str = "downloads"):
     if kind not in {"mod", "modpack"} or platform not in {"modrinth", "curseforge"}:
         raise HTTPException(status_code=422, detail="Choose Modrinth or CurseForge and a supported category.")
     if len(q) > 100 or offset < 0:
         raise HTTPException(status_code=422, detail="Search text or page offset is invalid.")
+    if sort not in {"downloads", "updated"}:
+        raise HTTPException(status_code=422, detail="Sort must be downloads or updated.")
     item = read_json(config_path(server_id)) if server_id else {"minecraft_version": "LATEST", "mod_loader": ""}
     if server_id and not item:
         raise HTTPException(status_code=404, detail="Server not found.")
     if kind == "mod" and item.get("mod_loader") not in MOD_LOADERS:
         raise HTTPException(status_code=409, detail="Select a mod loader such as Fabric or Forge in Types before browsing mods.")
     try:
-        return await (modrinth_search(kind, q, item, offset) if platform == "modrinth" else curseforge_search(kind, q, item, offset))
+        return await (modrinth_search(kind, q, item, offset, sort) if platform == "modrinth" else curseforge_search(kind, q, item, offset, sort))
     except HTTPException:
         raise
     except httpx.HTTPStatusError as err:

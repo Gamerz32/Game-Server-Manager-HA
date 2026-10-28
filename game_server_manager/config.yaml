@@ -2,7 +2,7 @@ name: "Game Server Manager"
 slug: game_server_manager
 description: >
   Manage multiple game servers from a Home Assistant dashboard. Minecraft Java is supported today, with room to add more games later.
-version: "2.5.5"
+version: "2.5.6"
 url: https://github.com/Gamerz32/Game-Server-Manager-HA
 
 arch:

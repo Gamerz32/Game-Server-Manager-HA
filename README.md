@@ -24,7 +24,7 @@ The app slug is now `game_server_manager`, which gives Home Assistant a new app 
 - The “Bukkit” choice runs the maintained Paper engine, which supports Bukkit plugins; upstream [itzg documentation](https://docker-minecraft-server.readthedocs.io/en/latest/types-and-platforms/server-types/bukkit-spigot/) notes automated Bukkit downloads are no longer supported.
 - Use Home Assistant ingress to open the dashboard in the sidebar.
 
-See the [Minecraft add-on guide](https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server) for setup, backups, migration, and troubleshooting.
+See the [Minecraft add-on guide](https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/game_server_manager) for setup, backups, migration, and troubleshooting.
 
 ## Docker access and security
 

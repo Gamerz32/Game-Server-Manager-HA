@@ -1,6 +1,6 @@
-# Minecraft Server Manager for Home Assistant
+# Game Server Manager for Home Assistant
 
-This fork contains one Home Assistant add-on: **Minecraft Server Manager**. It provides an ingress dashboard for creating and managing multiple Minecraft Java servers, each running in its own [itzg/minecraft-server](https://docker-minecraft-server.readthedocs.io/en/latest/) container.
+This fork contains one Home Assistant add-on: **Game Server Manager**. It currently provides an ingress dashboard for creating and managing multiple Minecraft Java servers, each running in its own [itzg/minecraft-server](https://docker-minecraft-server.readthedocs.io/en/latest/) container, with room to add other games later.
 
 ## Install
 
@@ -8,7 +8,11 @@ Add this repository to **Settings → Apps → App Store → Repositories**:
 
 https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS
 
-Then install **Minecraft Server Manager** from the app store.
+Then install **Game Server Manager** from the app store.
+
+## Home Assistant slug transition
+
+The app slug is now `game_server_manager`, which gives Home Assistant a new app ID and hostname. The new app uses a separate data location; existing server files are not moved automatically. Stop the old app and make a full Home Assistant backup before switching. Keep the old app data or backup until the servers and worlds have been migrated and verified under the new app.
 
 ## Dashboard features
 

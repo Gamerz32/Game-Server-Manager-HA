@@ -47,7 +47,7 @@ Minecraft Java is the only supported game today. Other games are not installable
 
 ## AI-assisted development
 
-AI tools, including OpenAI Codex, have assisted with planning, interface design, implementation, documentation, and troubleshooting for this project. The project maintainer is responsible for reviewing and maintaining the work. AI-assisted changes can contain errors, so report issues and verify behavior in your own Home Assistant setup before relying on it.
+This project uses AI tools for assisting with planning, interface design, implementation, documentation, and troubleshooting on this project. The project maintainer is responsible for reviewing and maintaining the work. AI-assisted changes can contain errors, so report issues and verify behavior in your own Home Assistant setup before relying on it.
 
 ## References
 

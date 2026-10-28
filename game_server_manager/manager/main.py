@@ -1426,7 +1426,13 @@ def curseforge_version_record(version: dict[str, Any], kind: str, game_version: 
         loader_id = 0
     version_loader = CF_LOADER_NAMES.get(loader_id, "")
     targets = [{"game_version": game, "loader": version_loader} for game in games]
-    compatible = (game_version in games and loader.lower() == version_loader) if kind == "mod" and game_version and loader else (game_version in games if kind == "plugin" and game_version else None)
+    if kind == "mod" and game_version and loader:
+        # CurseForge modLoaderType=0 means "Any", not an unsupported loader.
+        compatible = game_version in games and (loader_id == 0 or loader.lower() == version_loader)
+    elif kind == "plugin" and game_version:
+        compatible = game_version in games
+    else:
+        compatible = None
     try:
         release_type = {1: "release", 2: "beta", 3: "alpha"}.get(int(version.get("releaseType", 0) or 0), "")
     except (TypeError, ValueError):
@@ -1585,7 +1591,8 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
                     file_loader_id = int(file.get("modLoader", 0) or 0)
                 except (TypeError, ValueError):
                     file_loader_id = 0
-                if game in {str(value) for value in file_games} and (loader_id is None or file_loader_id == loader_id):
+                # CurseForge loader type 0 means "Any" and is valid for this loader.
+                if game in {str(value) for value in file_games} and (loader_id is None or file_loader_id in {0, loader_id}):
                     compatible = True
                     break
         elif kind == "plugin" and game:

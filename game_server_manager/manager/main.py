@@ -1373,21 +1373,6 @@ def server_mod_loader(item: dict[str, Any]) -> str:
     return canonical_mod_loader(item.get("mod_loader")) or canonical_mod_loader(item.get("server_type"))
 
 
-def modrinth_server_environment_compatible(version: dict[str, Any]) -> bool:
-    if str(version.get("server_side", "")).strip().lower() == "unsupported":
-        return False
-    environment = version.get("environment")
-    if isinstance(environment, str):
-        return environment.strip().lower() not in {"client_only", "singleplayer_only", "unsupported"}
-    if isinstance(environment, dict):
-        server_environment = str(environment.get("server", "")).strip().lower()
-        return server_environment != "unsupported"
-    if isinstance(environment, list):
-        values = {str(value).strip().lower() for value in environment}
-        return not values.intersection({"client_only", "singleplayer_only", "unsupported"})
-    return True
-
-
 def mod_compatibility(game_version: str, loader: str, game_versions: list[str], loaders: list[str]) -> bool | None:
     selected_loader = canonical_mod_loader(loader)
     if not game_version or not selected_loader:
@@ -1440,8 +1425,6 @@ def modrinth_version_record(version: dict[str, Any], kind: str, game_version: st
     files = version.get("files", [])
     size = next((int(f.get("size", 0)) for f in files if f.get("primary")), int(files[0].get("size", 0)) if files else 0)
     compatible = mod_compatibility(game_version, loader, games, loaders) if kind == "mod" else (game_version in games if kind == "plugin" and game_version else None)
-    if kind == "mod" and compatible is True and not modrinth_server_environment_compatible(version):
-        compatible = False
     return {"id": str(version.get("id", "")), "number": str(version.get("version_number", "")),
         "name": str(version.get("name", "")), "game_versions": games, "loaders": loaders, "targets": targets,
         "compatible": compatible,
@@ -1521,8 +1504,6 @@ async def validate_mod_version(platform: str, project_id: str, version_id: str, 
             version = response.json()
         if str(version.get("project_id", "")) != project_id:
             raise HTTPException(status_code=422, detail="The selected version does not belong to this mod.")
-        if not modrinth_server_environment_compatible(version):
-            raise HTTPException(status_code=409, detail="This Modrinth mod version is client-only and cannot be installed on a dedicated server.")
         if mod_compatibility(game_version, loader, version.get("game_versions", []), version.get("loaders", [])) is not True:
             raise HTTPException(status_code=409, detail="This mod version is not compatible with the server's Minecraft version and loader.")
         return

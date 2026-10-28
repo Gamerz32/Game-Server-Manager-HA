@@ -35,7 +35,7 @@ The dashboard itself is available through Home Assistant ingress. Start the app,
 
 ## Install and first run
 
-1. Add https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS to **Settings → Apps → App Store → Repositories**.
+1. Add https://github.com/Gamerz32/Game-Server-Manager-HA to **Settings → Apps → App Store → Repositories**.
 2. Install **Game Server Manager**.
 3. Turn off Protection mode and enable Docker API access for the app, then start it.
 4. Open **Game Servers** from the sidebar or the app's **Open Web UI** button.

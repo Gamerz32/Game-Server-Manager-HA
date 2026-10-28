@@ -6,7 +6,7 @@ Manage multiple game servers from a Home Assistant ingress dashboard. Minecraft 
 
 - Create as many Minecraft Java server cards as the host can support.
 - Each card shows a play or pause state control and a three-dot menu for Start/Stop, Terminal, and Settings.
-- Open the Types and Mods tabs to select Vanilla, server software, Modrinth modpacks, CurseForge modpacks, and compatible mods.
+- Use the Types, Mods, and Plugins tabs to select Vanilla or server software, choose Modrinth or CurseForge modpacks and versions, and manage compatible mods or plugins. Tabs remain visible and are disabled when they do not apply to the selected server type.
 - Use the built-in console to view live logs and send server commands through private RCON.
 - Edit memory, Java version, Minecraft version, port, and automation policies in the dashboard.
 
@@ -48,7 +48,7 @@ Minecraft Java is the only currently supported game. The EULA is shown at [aka.m
 
 Vanilla, Paper, Purpur, and mod loaders use the selected Minecraft version. Modrinth packs and mods are filtered for the selected game version and loader. CurseForge browsing and file lookups require an API key from the CurseForge developer console; save it in the dashboard's catalog settings.
 
-A pack or loader change can make an existing world or installed mods incompatible. The dashboard asks for confirmation before applying a type change. Paper and Purpur use plugins, which are not managed by the Mods tab.
+A pack, loader, or server type change can make an existing world or installed content incompatible. The dashboard asks for confirmation before applying a type change. Bukkit, Paper, and Purpur plugin management is in the dedicated Plugins tab; Mods is for compatible mod loaders.
 
 ## Backups, migration, and removal
 

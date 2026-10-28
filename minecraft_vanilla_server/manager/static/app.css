@@ -99,12 +99,12 @@
 
 .catalog-discovery{margin:16px 0 12px}
 .provider-switch{display:inline-flex;align-items:center;gap:5px;padding:4px;border:1px solid #35393c;border-radius:12px;background:#17191b}
-.provider-button{position:relative;display:inline-flex;align-items:center;gap:9px;min-height:42px;padding:5px 13px;border:1px solid transparent;border-radius:9px;background:transparent;color:#bac0c4;font:inherit;font-size:13px;font-weight:600;transition:background .16s,border-color .16s,color .16s}
+.provider-button{position:relative;display:inline-flex;width:44px;min-width:44px;min-height:42px;align-items:center;justify-content:center;gap:0;padding:5px;border:1px solid transparent;border-radius:9px;background:transparent;color:#bac0c4;font:inherit;transition:background .16s,border-color .16s,color .16s}
 .provider-button:hover{background:#242729;color:#f1f3f4}
 .provider-button.selected{border-color:#484d50;background:#242729;color:#f4f6f7}
-.provider-mark{position:relative;display:grid;width:29px;height:29px;place-items:center;flex:0 0 29px;border-radius:8px;font-size:13px;font-weight:800;letter-spacing:-.06em}
+.provider-mark{position:relative;display:grid;width:29px;height:29px;place-items:center;flex:0 0 29px;border-radius:8px}.provider-logo{display:block;width:18px;height:18px;object-fit:contain}
 .modrinth-mark{background:radial-gradient(circle at 48% 45%,#69ef9a44,transparent 74%),#183324;color:#7be5a2;box-shadow:0 0 15px #39d37952}
-.curseforge-mark{background:radial-gradient(circle at 48% 45%,#ff9f5c44,transparent 74%),#392416;color:#ffab67;box-shadow:0 0 15px #f1783152;font-size:9px;letter-spacing:-.05em}
+.curseforge-mark{background:radial-gradient(circle at 48% 45%,#ff9f5c44,transparent 74%),#392416;box-shadow:0 0 15px #f1783152}
 .provider-button.selected .modrinth-mark{box-shadow:0 0 21px #39d3798a}
 .provider-button.selected .curseforge-mark{box-shadow:0 0 21px #f178318a}
 .catalog-toolbar{align-items:center}
@@ -135,7 +135,7 @@
 .catalog-sort{flex:1;width:auto}
 .catalog-list-row{grid-template-columns:42px minmax(0,1fr);gap:10px}
 .catalog-list-meta{grid-column:2;align-items:flex-start;flex-direction:row;flex-wrap:wrap}
-.provider-button{padding:5px 8px;font-size:12px}
+.provider-button{width:42px;min-width:42px;min-height:40px;padding:4px}
 }
 
 .version-catalog .version-list-head,.version-catalog .version-row{grid-template-columns:minmax(92px,1.15fr) minmax(105px,1.2fr) minmax(48px,.5fr) minmax(82px,.9fr) minmax(78px,.85fr) 66px}

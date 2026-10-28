@@ -1,12 +1,13 @@
-FROM ghcr.io/itzg/minecraft-server:latest
+FROM python:3.12-slim
 
-# The upstream image provides the Minecraft runtime and launchers. jq is used
-# only to translate Home Assistant's /data/options.json into those settings.
-USER root
-RUN apt-get update \
-    && apt-get install -y --no-install-recommends jq \
-    && rm -rf /var/lib/apt/lists/*
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
+
+COPY manager /app/manager
 COPY run.sh /run.sh
 RUN chmod 0755 /run.sh
 

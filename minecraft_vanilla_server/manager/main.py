@@ -1,13 +1,13 @@
 from __future__ import annotations
 
+import asyncio
 import html
 import json
 import logging
 import os
 import re
 import secrets
-import shutil
-import threading
+import shutilimport threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -38,6 +38,11 @@ CF_CLASS_IDS = {"modpack": 4471, "mod": 6}
 MODRINTH_BASE = "https://api.modrinth.com/v2"
 CURSEFORGE_BASE = "https://api.curseforge.com/v1"
 JAVA_TAGS = {"auto": "latest", "8": "java8", "17": "java17", "21": "java21", "25": "java25"}
+UPDATE_CHECK_INTERVAL = 4 * 60 * 60
+MAINTENANCE_INTERVAL = 60
+UPDATE_DISCONNECT_REASON = "The Server is Updating, Please Wait"
+GATEWAYS: dict[str, tuple[asyncio.AbstractServer, int]] = {}
+MAINTENANCE_TASK: asyncio.Task | None = None {}
 SERVER_TYPES = {"VANILLA", "PAPER", "PURPUR", "FABRIC", "FORGE", "NEOFORGE", "QUILT", "MODRINTH", "AUTO_CURSEFORGE"}
 MOD_LOADERS = {"FABRIC", "FORGE", "NEOFORGE", "QUILT"}
 CF_LOADER_IDS = {"FORGE": 1, "FABRIC": 4, "QUILT": 5, "NEOFORGE": 6}
@@ -246,8 +251,8 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
         max_ram = int(data.get("max_ram_mb", 4096))
     except (ValueError, TypeError):
         raise HTTPException(status_code=422, detail="Port and RAM values must be whole numbers.")
-    if port < 1024 or port > 65535:
-        raise HTTPException(status_code=422, detail="Choose a TCP port between 1024 and 65535.")
+    if port < 1024 or port > 65535 or port == 8099:
+        raise HTTPException(status_code=422, detail="Choose a TCP port between 1024 and 65535, excluding 8099 (the manager UI port).")
     if min_ram < 512 or max_ram < min_ram or max_ram > 131072:
         raise HTTPException(status_code=422, detail="RAM must be at least 512 MB, with maximum RAM greater than or equal to minimum RAM.")
     java = str(data.get("java_version", "auto"))
@@ -265,6 +270,15 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
             continue
         if item.get("id") != existing_id and assigned_port == port:
             raise HTTPException(status_code=409, detail=f"Port {port} is already assigned to {item.get('name', 'another server')}.")
+    def bounded_int(key: str, default: int, low: int, high: int) -> int:
+        try:
+            value = int(data.get(key, default))
+        except (ValueError, TypeError):
+            raise HTTPException(status_code=422, detail=f"{key.replace('_', ' ').title()} must be a whole number.")
+        if value < low or value > high:
+            raise HTTPException(status_code=422, detail=f"{key.replace('_', ' ').title()} must be between {low} and {high}.")
+        return value
+
     return {
         "name": name,
         "port": port,
@@ -272,6 +286,13 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
         "max_ram_mb": max_ram,
         "java_version": java,
         "minecraft_version": mc_version,
+        "auto_pause_enabled": data.get("auto_pause_enabled", False) is True,
+        "auto_pause_minutes": bounded_int("auto_pause_minutes", 20, 5, 1440),
+        "auto_stop_enabled": data.get("auto_stop_enabled", False) is True,
+        "auto_stop_days": bounded_int("auto_stop_days", 3, 1, 365),
+        "auto_update_enabled": data.get("auto_update_enabled", False) is True,
+        "auto_update_idle_hours": bounded_int("auto_update_idle_hours", 3, 1, 168),
+        "wake_on_join": data.get("wake_on_join", True) is not False,
     }
 
 
@@ -357,7 +378,7 @@ def run_container(server_id: str) -> None:
         name=f"ha-minecraft-{server_id}",
         labels=labels,
         environment=env,
-        ports={"25565/tcp": int(item["port"])},
+        network_mode="bridge",
         volumes={str(data_source): {"bind": "/data", "mode": "rw"}},
         restart_policy={"Name": "unless-stopped"},
         tty=True,
@@ -383,6 +404,9 @@ def stop_container(server_id: str, remove: bool = False, timeout: int = 120) -> 
         return
     try:
         container.reload()
+        if container.status == "paused":
+            container.unpause()
+            container.reload()
         if container.status == "running":
             container.stop(timeout=timeout)
         if remove:
@@ -421,14 +445,567 @@ def ensure_running(server_id: str) -> None:
     status, container = current_status(server_id)
     if status == "running":
         return
+    if container is not None and status == "paused":
+        container.unpause()
+        item = read_json(config_path(server_id))
+        item["desired_state"] = "running"
+        item["job_state"] = "running"
+        item["auto_paused"] = False
+        write_json(config_path(server_id), item)
+        return
     if container is not None and status == "exited":
         container.start()
         item = read_json(config_path(server_id))
         item["desired_state"] = "running"
         item["job_state"] = "running"
+        item["auto_stopped"] = False
+        item["auto_paused"] = False
         write_json(config_path(server_id), item)
         return
     run_container(server_id)
+
+
+def wake_server_locked(server_id: str) -> None:
+    with server_lock(server_id):
+        ensure_running(server_id)
+
+
+def encode_varint(value: int) -> bytes:
+    value &= 0xFFFFFFFF
+    output = bytearray()
+    while value & 0xFFFFFF80:
+        output.append((value & 0x7F) | 0x80)
+        value >>= 7
+    output.append(value & 0x7F)
+    return bytes(output)
+
+
+def decode_varint(data: bytes, offset: int = 0) -> tuple[int, int]:
+    result = 0
+    shift = 0
+    while offset < len(data) and shift < 35:
+        byte = data[offset]
+        offset += 1
+        result |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return result, offset
+        shift += 7
+    raise ValueError("Invalid Minecraft VarInt.")
+
+
+async def read_mc_frame(reader: asyncio.StreamReader) -> tuple[bytes, bytes]:
+    prefix = bytearray()
+    length = 0
+    shift = 0
+    while shift < 35:
+        byte = (await reader.readexactly(1))[0]
+        prefix.append(byte)
+        length |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            break
+        shift += 7
+    if length < 0 or length > 2_097_152:
+        raise ValueError("Minecraft packet is too large.")
+    payload = await reader.readexactly(length)
+    return bytes(prefix) + payload, payload
+
+
+def parse_handshake(payload: bytes) -> int | None:
+    try:
+        packet_id, offset = decode_varint(payload)
+        if packet_id != 0:
+            return None
+        _, offset = decode_varint(payload, offset)
+        address_length, offset = decode_varint(payload, offset)
+        offset += address_length + 2
+        intent, _ = decode_varint(payload, offset)
+        return intent
+    except (ValueError, IndexError):
+        return None
+
+
+def mc_packet(packet_id: int, payload: bytes = b"") -> bytes:
+    body = encode_varint(packet_id) + payload
+    return encode_varint(len(body)) + body
+
+
+def mc_string(value: str) -> bytes:
+    encoded = value.encode("utf-8")
+    return encode_varint(len(encoded)) + encoded
+
+
+async def close_writer(writer: asyncio.StreamWriter) -> None:
+    try:
+        writer.close()
+        await writer.wait_closed()
+    except (ConnectionError, OSError):
+        pass
+
+
+async def send_login_disconnect(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, reason: str) -> None:
+    try:
+        await asyncio.wait_for(read_mc_frame(reader), timeout=8)
+        payload = json.dumps({"text": reason}, ensure_ascii=False, separators=(",", ":"))
+        writer.write(mc_packet(0, mc_string(payload)))
+        await writer.drain()
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
+        pass
+
+
+async def send_offline_status(reader: asyncio.StreamReader, writer: asyncio.StreamWriter, message: str) -> None:
+    try:
+        frame, payload = await asyncio.wait_for(read_mc_frame(reader), timeout=5)
+        packet_id, offset = decode_varint(payload)
+        if packet_id == 0:
+            status = {
+                "version": {"name": "Minecraft Server Manager", "protocol": -1},
+                "players": {"max": 0, "online": 0, "sample": []},
+                "description": {"text": message},
+            }
+            data = json.dumps(status, ensure_ascii=False, separators=(",", ":"))
+            writer.write(mc_packet(0, mc_string(data)))
+            await writer.drain()
+            try:
+                ping_frame, ping_payload = await asyncio.wait_for(read_mc_frame(reader), timeout=2)
+                ping_id, ping_offset = decode_varint(ping_payload)
+                if ping_id == 1:
+                    writer.write(mc_packet(1, ping_payload[ping_offset:]))
+                    await writer.drain()
+            except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
+                pass
+        elif packet_id == 1 and len(payload) >= offset + 8:
+            writer.write(mc_packet(1, payload[offset:offset + 8]))
+            await writer.drain()
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
+        pass
+
+
+def backend_address(server_id: str) -> tuple[str, int] | None:
+    try:
+        container = get_container(server_id)
+        if container.status != "running":
+            return None
+        networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+        for details in networks.values():
+            address = details.get("IPAddress")
+            if address:
+                return str(address), 25565
+        address = container.attrs.get("NetworkSettings", {}).get("IPAddress")
+        return (str(address), 25565) if address else None
+    except (DockerException, NotFound):
+        return None
+
+
+async def proxy_to_backend(server_id: str, client_reader: asyncio.StreamReader, client_writer: asyncio.StreamWriter, handshake: bytes) -> bool:
+    address = await asyncio.to_thread(backend_address, server_id)
+    if not address:
+        return False
+    try:
+        backend_reader, backend_writer = await asyncio.wait_for(asyncio.open_connection(*address), timeout=5)
+        backend_writer.write(handshake)
+        await backend_writer.drain()
+
+        async def copy_stream(source: asyncio.StreamReader, destination: asyncio.StreamWriter) -> None:
+            while True:
+                data = await source.read(65536)
+                if not data:
+                    break
+                destination.write(data)
+                await destination.drain()
+
+        tasks = [
+            asyncio.create_task(copy_stream(client_reader, backend_writer)),
+            asyncio.create_task(copy_stream(backend_reader, client_writer)),
+        ]
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        backend_writer.close()
+        await backend_writer.wait_closed()
+        return True
+    except (asyncio.TimeoutError, ConnectionError, OSError, DockerException):
+        return False
+
+
+async def handle_minecraft_connection(server_id: str, reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        handshake, payload = await asyncio.wait_for(read_mc_frame(reader), timeout=8)
+        intent = parse_handshake(payload)
+        if intent not in {1, 2}:
+            return
+        item = read_json(config_path(server_id))
+        if not item or item.get("deleting"):
+            return
+        status, _ = current_status(server_id)
+        if intent == 1:
+            if status == "running" and not item.get("updating"):
+                if await proxy_to_backend(server_id, reader, writer, handshake):
+                    return
+            message = UPDATE_DISCONNECT_REASON if item.get("updating") else (
+                "Server is starting." if status in {"paused", "created", "restarting"} else "Server is stopped."
+            )
+            await send_offline_status(reader, writer, message)
+            return
+        if item.get("updating"):
+            await send_login_disconnect(reader, writer, UPDATE_DISCONNECT_REASON)
+            return
+        if status == "paused":
+            try:
+                await asyncio.wait_for(asyncio.to_thread(wake_server_locked, server_id), timeout=8)
+            except Exception:
+                await send_login_disconnect(reader, writer, "Server is starting. Please try again shortly.")
+                return
+            status, _ = current_status(server_id)
+        elif status in {"stopped", "exited", "created"} and item.get("wake_on_join", True):
+            should_wake = item.get("auto_stopped") or item.get("desired_state") == "running"
+            if should_wake:
+                item["desired_state"] = "running"
+                item["auto_stopped"] = False
+                item["job_state"] = "starting"
+                write_json(config_path(server_id), item)
+                submit_job(server_id, "wake on join", lambda: ensure_running(server_id))
+                await send_login_disconnect(reader, writer, "Server is starting. Please try again shortly.")
+                return
+        if status == "running":
+            if await proxy_to_backend(server_id, reader, writer, handshake):
+                return
+            await send_login_disconnect(reader, writer, "Server is starting. Please try again shortly.")
+        else:
+            await send_login_disconnect(reader, writer, "Server is stopped.")
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError, ValueError):
+        pass
+    except Exception:
+        LOG.exception("Minecraft gateway request failed for server %s", server_id)
+    finally:
+        await close_writer(writer)
+
+
+async def ensure_gateway(server_id: str) -> None:
+    item = read_json(config_path(server_id))
+    if not item or item.get("deleting"):
+        return
+    port = int(item["port"])
+    current = GATEWAYS.get(server_id)
+    if current and current[1] == port and current[0].is_serving():
+        return
+    for other_id, (_, other_port) in GATEWAYS.items():
+        if other_id != server_id and other_port == port:
+            raise OSError(f"TCP port {port} is already managed by another server.")
+    server = await asyncio.start_server(
+        lambda reader, writer: handle_minecraft_connection(server_id, reader, writer),
+        host="0.0.0.0",
+        port=port,
+        reuse_address=True,
+        backlog=128,
+    )
+    old = GATEWAYS.get(server_id)
+    GATEWAYS[server_id] = (server, port)
+    if old:
+        old[0].close()
+        await old[0].wait_closed()
+
+
+async def close_gateway(server_id: str) -> None:
+    current = GATEWAYS.pop(server_id, None)
+    if current:
+        current[0].close()
+        await current[0].wait_closed()
+
+
+def rcon_output(server_id: str, command: str) -> str:
+    container = get_container(server_id)
+    if container.status != "running":
+        raise RuntimeError("The server is not running.")
+    result = container.exec_run(["rcon-cli", command], stdout=True, stderr=True, demux=False)
+    output = result.output or b""
+    return output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+
+
+def online_player_count(server_id: str) -> int | None:
+    try:
+        output = rcon_output(server_id, "list")
+    except (DockerException, RuntimeError):
+        return None
+    match = re.search(r"There are\s+(\d+)\s+of a max", output, re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _compatible_modrinth_version(version: dict[str, Any], game_version: str, loader: str) -> bool:
+    games = version.get("game_versions") or []
+    loaders = [str(value).lower() for value in version.get("loaders") or []]
+    return game_version in games and (not loader or loader.lower() in loaders)
+
+
+def provider_update(item: dict[str, Any], platform: str, project_id: str, current_id: str, kind: str) -> dict[str, Any] | None:
+    game_version = str(item.get("minecraft_version", "LATEST"))
+    loader = str(item.get("mod_loader", "")).lower()
+    try:
+        if platform == "modrinth":
+            response = httpx.get(
+                f"{MODRINTH_BASE}/project/{project_id}/version",
+                params={"game_versions": json.dumps([game_version]), "loaders": json.dumps([loader]) if loader else "[]"},
+                timeout=15,
+                headers={"User-Agent": "Gamerz32/MinecraftServerManager/2.1"},
+            )
+            response.raise_for_status()
+            versions = response.json()
+            for version in versions:
+                if not _compatible_modrinth_version(version, game_version, loader):
+                    continue
+                latest_id = str(version.get("id", ""))
+                if latest_id and latest_id != current_id:
+                    return {"kind": kind, "platform": platform, "project_id": project_id,
+                        "version_id": latest_id, "name": str(version.get("name") or version.get("version_number") or "New version")}
+                break
+        else:
+            api_key = settings().get("curseforge_api_key", "").strip()
+            if not project_id.isdigit():
+                return None
+            if not api_key:
+                raise ValueError("Add a CurseForge API key to check this project.")
+            params: dict[str, Any] = {"pageSize": 50, "index": 0, "gameVersion": game_version, "sortField": 3, "sortOrder": "desc"}
+            loader_id = CF_LOADER_IDS.get(loader.upper())
+            if loader_id:
+                params["modLoaderType"] = loader_id
+            response = httpx.get(
+                f"{CURSEFORGE_BASE}/mods/{project_id}/files",
+                params=params,
+                headers={"x-api-key": api_key, "Accept": "application/json"},
+                timeout=15,
+            )
+            response.raise_for_status()
+            data = response.json().get("data") or []
+            for version in data:
+                if game_version not in [str(value) for value in (version.get("gameVersions") or [])]:
+                    continue
+                latest_id = str(version.get("id", ""))
+                if latest_id and latest_id != current_id:
+                    return {"kind": kind, "platform": platform, "project_id": project_id,
+                        "file_id": latest_id, "name": str(version.get("displayName") or version.get("fileName") or "New version")}
+                break
+    except (httpx.HTTPError, ValueError, TypeError) as err:
+        LOG.warning("Could not check %s updates for project %s: %s", platform, project_id, err)
+        raise
+    return None
+
+
+def dockerhub_latest_digest(image: str) -> str | None:
+    tag = image.rsplit(":", 1)[-1]
+    try:
+        auth = httpx.get(
+            "https://auth.docker.io/token",
+            params={"service": "registry.docker.io", "scope": "repository:itzg/minecraft-server:pull"},
+            timeout=12,
+        )
+        auth.raise_for_status()
+        token = auth.json().get("token")
+        if not token:
+            return None
+        response = httpx.head(
+            f"https://registry-1.docker.io/v2/itzg/minecraft-server/manifests/{tag}",
+            headers={
+                "Authorization": f"Bearer {token}",
+                "Accept": "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
+            },
+            timeout=12,
+        )
+        response.raise_for_status()
+        return response.headers.get("Docker-Content-Digest")
+    except httpx.HTTPError:
+        return None
+
+
+def check_server_updates(server_id: str) -> None:
+    item = read_json(config_path(server_id))
+    if not item:
+        return
+    updates: list[dict[str, Any]] = []
+    check_errors: list[str] = []
+    pack = item.get("modpack") or {}
+    if pack:
+        current_id = str(pack.get("version_id") or pack.get("file_id") or "")
+        try:
+            update = provider_update(item, str(pack.get("platform", "")), str(pack.get("project_id", "")), current_id, "modpack")
+            if update:
+                updates.append(update)
+        except (httpx.HTTPError, ValueError, TypeError) as err:
+            check_errors.append(f"Modpack check: {str(err)[:160]}")
+    for mod in item.get("mods", []):
+        current_id = str(mod.get("version_id") or mod.get("file_id") or "")
+        try:
+            update = provider_update(item, str(mod.get("platform", "")), str(mod.get("project_id", "")), current_id, "mod")
+            if update:
+                update["title"] = str(mod.get("title") or update.get("name") or "Mod")
+                updates.append(update)
+        except (httpx.HTTPError, ValueError, TypeError) as err:
+            check_errors.append(f"{mod.get('title') or 'Mod'} check: {str(err)[:160]}")
+    current_version = str(item.get("minecraft_version", "LATEST"))
+    can_advance_minecraft = item.get("server_type") in {"VANILLA", "PAPER", "PURPUR"} and not item.get("mods")
+    try:
+        manifest_response = httpx.get(MINECRAFT_MANIFEST_URL, timeout=15)
+        manifest_response.raise_for_status()
+        manifest = manifest_response.json()
+        latest = manifest.get("latest") or {}
+        entries = manifest.get("versions") or []
+        current_entry = next((entry for entry in entries if entry.get("id") == current_version), None)
+        channel = current_entry.get("type") if current_entry else "release"
+        target = latest.get("snapshot" if channel == "snapshot" or current_version.upper() == "SNAPSHOT" else "release")
+        if can_advance_minecraft and target and current_version not in {"LATEST", "SNAPSHOT"} and target != current_version:
+            updates.append({"kind": "minecraft", "minecraft_version": target})
+        elif can_advance_minecraft and current_version.upper() == "SNAPSHOT" and latest.get("snapshot"):
+            updates.append({"kind": "minecraft", "minecraft_version": latest["snapshot"]})
+    except (httpx.HTTPError, ValueError, TypeError) as err:
+        check_errors.append(f"Minecraft version check: {str(err)[:160]}")
+        LOG.warning("Could not check Mojang version updates for server %s: %s", server_id, err)
+    image = f"{SERVER_IMAGE}:{JAVA_TAGS.get(str(item.get('java_version', 'auto')), 'latest')}"
+    remote_digest = dockerhub_latest_digest(image)
+    try:
+        local = docker_client().images.get(image)
+        local_digests = [str(value).split("@")[-1] for value in (local.attrs.get("RepoDigests") or [])]
+        if remote_digest and local_digests and remote_digest not in local_digests:
+            updates.append({"kind": "server_image"})
+    except (DockerException, ImageNotFound):
+        pass
+    item["updates_available"] = updates
+    item["last_update_check"] = time.time()
+    item["update_check_error"] = "; ".join(check_errors)[:500]
+    write_json(config_path(server_id), item)
+
+
+def apply_server_updates(server_id: str, force: bool = False) -> None:
+    item = read_json(config_path(server_id))
+    if not item:
+        raise RuntimeError("Server configuration was not found.")
+    updates = list(item.get("updates_available") or [])
+    if not updates and not force:
+        return
+    status, _ = current_status(server_id)
+    was_running = status in {"running", "paused", "exited"} and item.get("desired_state") == "running"
+    item["updating"] = True
+    item["update_error"] = ""
+    item["job_state"] = "updating"
+    write_json(config_path(server_id), item)
+    try:
+        for update in updates:
+            if update.get("kind") == "minecraft":
+                item["minecraft_version"] = str(update["minecraft_version"])
+            elif update.get("kind") == "modpack":
+                pack = item.get("modpack") or {}
+                if update.get("version_id"):
+                    pack["version_id"] = update["version_id"]
+                if update.get("file_id"):
+                    pack["file_id"] = update["file_id"]
+                item["modpack"] = pack
+            elif update.get("kind") == "mod":
+                for mod in item.get("mods", []):
+                    if mod.get("platform") == update.get("platform") and str(mod.get("project_id")) == str(update.get("project_id")):
+                        if update.get("version_id"):
+                            mod["version_id"] = update["version_id"]
+                        if update.get("file_id"):
+                            mod["file_id"] = update["file_id"]
+        write_json(config_path(server_id), item)
+        stop_container(server_id, remove=True, timeout=120)
+        image = f"{SERVER_IMAGE}:{JAVA_TAGS.get(str(item.get('java_version', 'auto')), 'latest')}"
+        docker_client().images.pull(image)
+        if was_running:
+            run_container(server_id)
+            deadline = time.time() + 600
+            while time.time() < deadline:
+                if online_player_count(server_id) is not None:
+                    break
+                time.sleep(3)
+            else:
+                raise RuntimeError("The server did not become ready after the update. Check its console logs.")
+        item = read_json(config_path(server_id))
+        item["updating"] = False
+        item["updates_available"] = []
+        item["last_update_at"] = time.time()
+        item["last_update_check"] = time.time()
+        item["job_state"] = "running" if was_running else "stopped"
+        write_json(config_path(server_id), item)
+    except Exception as err:
+        item = read_json(config_path(server_id))
+        item["updating"] = False
+        item["update_error"] = str(err)[:500]
+        item["job_state"] = "update-failed"
+        write_json(config_path(server_id), item)
+        raise
+
+
+def maintain_server(server_id: str) -> None:
+    with server_lock(server_id):
+        item = read_json(config_path(server_id))
+        if not item or item.get("updating") or item.get("deleting"):
+            return
+        now = time.time()
+        status, container = current_status(server_id)
+        verified_empty = False
+        if status == "running":
+            players = online_player_count(server_id)
+            if players is not None and players > 0:
+                item["last_player_seen"] = now
+                item["empty_since"] = None
+                item["auto_paused"] = False
+            elif players == 0:
+                verified_empty = True
+                if not item.get("empty_since"):
+                    item["empty_since"] = now
+                item["last_player_seen"] = item.get("last_player_seen") or now
+                idle = now - float(item.get("empty_since") or now)
+                if item.get("auto_pause_enabled") and idle >= int(item.get("auto_pause_minutes", 20)) * 60:
+                    try:
+                        container.stop(timeout=60)
+                        item["auto_paused"] = True
+                        item["job_state"] = "paused"
+                        status = "paused"
+                    except DockerException:
+                        LOG.exception("Could not auto-pause server %s", server_id)
+        elif status == "paused":
+            verified_empty = bool(item.get("auto_paused"))
+        elif status == "exited" and item.get("auto_paused"):
+            verified_empty = True
+        elif status in {"stopped", "exited"} and item.get("desired_state") == "stopped":
+            verified_empty = True
+        if item.get("auto_update_enabled") and now - float(item.get("last_update_check") or 0) >= UPDATE_CHECK_INTERVAL:
+            write_json(config_path(server_id), item)
+            check_server_updates(server_id)
+            item = read_json(config_path(server_id))
+        empty_since = float(item.get("empty_since") or item.get("last_player_seen") or now)
+        idle_hours = (now - empty_since) / 3600
+        if verified_empty and item.get("auto_update_enabled") and item.get("updates_available") and idle_hours >= int(item.get("auto_update_idle_hours", 3)):
+            item["job_state"] = "update-queued"
+            item["updating"] = True
+            write_json(config_path(server_id), item)
+            submit_job(server_id, "automatic update", lambda: apply_server_updates(server_id))
+            return
+        if verified_empty and item.get("auto_stop_enabled") and status in {"running", "paused", "exited"} and item.get("desired_state") == "running" and idle_hours >= int(item.get("auto_stop_days", 3)) * 24:
+            item["desired_state"] = "stopped"
+            item["auto_stopped"] = True
+            item["auto_paused"] = False
+            item["job_state"] = "auto-stopping"
+            write_json(config_path(server_id), item)
+            stop_container(server_id, remove=True, timeout=120)
+            item["job_state"] = "auto-stopped"
+            write_json(config_path(server_id), item)
+            return
+        write_json(config_path(server_id), item)
+
+async def maintenance_loop() -> None:
+    while True:
+        try:
+            ids = [item["id"] for item in all_configs()]
+            await asyncio.gather(*(asyncio.to_thread(maintain_server, server_id) for server_id in ids))
+            for server_id in ids:
+                try:
+                    await ensure_gateway(server_id)
+                except OSError:
+                    LOG.exception("Could not maintain gateway for server %s", server_id)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            LOG.exception("Minecraft maintenance cycle failed")
+        await asyncio.sleep(MAINTENANCE_INTERVAL)
 
 
 class StripHTML(HTMLParser):
@@ -653,9 +1230,9 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
     return {"hits": hits, "total_hits": data.get("pagination", {}).get("totalCount", 0)}
 
 
-@asynccontextmanager@asynccontextmanager
+@asynccontextmanager
 async def lifespan(app: FastAPI):
-    global DOCKER_ERROR, HOST_DATA_SOURCE, SHUTTING_DOWN
+    global DOCKER_ERROR, HOST_DATA_SOURCE, SHUTTING_DOWN, MAINTENANCE_TASK
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SERVERS_DIR.mkdir(parents=True, exist_ok=True)
     try:
@@ -668,16 +1245,27 @@ async def lifespan(app: FastAPI):
         HOST_DATA_SOURCE = docker_self_data_source(cli)
         DOCKER_ERROR = None
         for item in all_configs():
+            try:
+                await ensure_gateway(item["id"])
+            except OSError:
+                LOG.exception("Could not bind Minecraft gateway for %s", item.get("name"))
             if item.get("desired_state") == "running":
                 submit_job(item["id"], "resume", lambda sid=item["id"]: ensure_running(sid))
     except Exception as err:
         DOCKER_ERROR = str(err)
         LOG.error("Docker Engine is unavailable: %s", err)
+    MAINTENANCE_TASK = asyncio.create_task(maintenance_loop())
     yield
-    # Finish active container work before stopping children for an upgrade or backup.
     SHUTTING_DOWN = True
+    if MAINTENANCE_TASK:
+        MAINTENANCE_TASK.cancel()
+        try:
+            await MAINTENANCE_TASK
+        except asyncio.CancelledError:
+            pass
+    for server_id in list(GATEWAYS):
+        await close_gateway(server_id)
     POOL.shutdown(wait=True, cancel_futures=True)
-    # A cold Home Assistant backup or a normal app stop must let worlds save first.
     try:
         ids = [x["id"] for x in all_configs()]
         with ThreadPoolExecutor(max_workers=max(1, min(len(ids), 16))) as pool:
@@ -810,9 +1398,16 @@ async def create_server(payload: dict[str, Any]):
         **clean, "id": server_id, "created_at": __import__("datetime").datetime.now().isoformat(),
         "server_type": kind, "mod_loader": mod_loader,
         "modpack": modpack, "mods": [], "desired_state": "running", "job_state": "queued",
+        "last_player_seen": time.time(), "empty_since": None, "updates_available": [],
+        "last_update_check": 0, "updating": False, "auto_paused": False, "auto_stopped": False,
     }
     server_dir(server_id).mkdir(parents=True, exist_ok=True)
     write_json(config_path(server_id), item)
+    try:
+        await ensure_gateway(server_id)
+    except OSError as err:
+        shutil.rmtree(server_dir(server_id), ignore_errors=True)
+        raise HTTPException(status_code=409, detail=f"Could not listen on TCP port {clean['port']}: {err}")
     job_id = submit_job(server_id, "create", lambda: run_container(server_id))
     return {"server": public_server(item), "job_id": job_id}
 
@@ -830,21 +1425,32 @@ async def update_server(server_id: str, payload: dict[str, Any]):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    if item.get("updating"):
+        raise HTTPException(status_code=409, detail="Server settings cannot be changed while the server is updating.")
+    original = dict(item)
     merged = {**item, **payload}
     clean = validate_config(merged, existing_id=server_id)
     was_running = item.get("desired_state") == "running"
+    restart_required = any(item.get(key) != clean.get(key) for key in ("name", "min_ram_mb", "max_ram_mb", "java_version", "minecraft_version"))
     item.update(clean)
     write_json(config_path(server_id), item)
-    if was_running:
+    try:
+        await ensure_gateway(server_id)
+    except OSError as err:
+        write_json(config_path(server_id), original)
+        raise HTTPException(status_code=409, detail=f"Could not listen on TCP port {clean['port']}: {err}")
+    if was_running and restart_required:
         def update_and_start():
             stop_container(server_id, remove=True)
             run_container(server_id)
         job_id = submit_job(server_id, "update settings", update_and_start)
-    else:
+    elif restart_required:
         try:
             stop_container(server_id, remove=True)
         except DockerException:
             pass
+        job_id = None
+    else:
         job_id = None
     return {"server": public_server(item), "job_id": job_id}
 
@@ -854,8 +1460,18 @@ async def start_server(server_id: str):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    if item.get("updating"):
+        raise HTTPException(status_code=409, detail="The server is updating.")
+    original = dict(item)
     item["desired_state"] = "running"
+    item["auto_stopped"] = False
+    item["auto_paused"] = False
     write_json(config_path(server_id), item)
+    try:
+        await ensure_gateway(server_id)
+    except OSError as err:
+        write_json(config_path(server_id), original)
+        raise HTTPException(status_code=409, detail=f"Could not listen on TCP port {item['port']}: {err}")
     job_id = submit_job(server_id, "start", lambda: ensure_running(server_id))
     return {"job_id": job_id}
 
@@ -865,10 +1481,28 @@ async def stop_server(server_id: str):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    if item.get("updating"):
+        raise HTTPException(status_code=409, detail="The server is updating.")
     item["desired_state"] = "stopped"
+    item["auto_stopped"] = False
+    item["auto_paused"] = False
     item["job_state"] = "stopping"
     write_json(config_path(server_id), item)
     job_id = submit_job(server_id, "stop", lambda: stop_container(server_id, False, 120))
+    return {"job_id": job_id}
+
+
+@app.post("/api/servers/{server_id}/update")
+async def update_server_now(server_id: str):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    if item.get("updating"):
+        raise HTTPException(status_code=409, detail="This server is already updating.")
+    item["updating"] = True
+    item["job_state"] = "update-queued"
+    write_json(config_path(server_id), item)
+    job_id = submit_job(server_id, "manual update", lambda: apply_server_updates(server_id, force=True))
     return {"job_id": job_id}
 
 
@@ -877,6 +1511,8 @@ async def install_type(server_id: str, payload: dict[str, Any]):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    if item.get("updating"):
+        raise HTTPException(status_code=409, detail="The server is updating.")
     kind = str(payload.get("kind", "")).upper()
     provider = str(payload.get("provider", "")).lower()
     requested_version = str(payload.get("minecraft_version", item.get("minecraft_version", "LATEST"))).strip()
@@ -911,12 +1547,16 @@ async def install_type(server_id: str, payload: dict[str, Any]):
                     "title": str(project.get("title", "CurseForge pack"))[:120], "file_id": file_id}})
     else:
         raise HTTPException(status_code=422, detail="Choose a supported server type or modpack.")
-    item["desired_state"] = "running"
+    was_running = item.get("desired_state") == "running"
     write_json(config_path(server_id), item)
-    def change_type():
+    job_id = None
+    if was_running:
+        def change_type():
+            stop_container(server_id, remove=True)
+            run_container(server_id)
+        job_id = submit_job(server_id, "install type", change_type)
+    else:
         stop_container(server_id, remove=True)
-        run_container(server_id)
-    job_id = submit_job(server_id, "install type", change_type)
     return {"server": public_server(item), "job_id": job_id}
 
 
@@ -927,6 +1567,8 @@ async def add_mod(server_id: str, payload: dict[str, Any]):
         raise HTTPException(status_code=404, detail="Server not found.")
     if item.get("mod_loader") not in MOD_LOADERS:
         raise HTTPException(status_code=409, detail="Choose a compatible mod loader or modpack in the Types tab before adding mods.")
+    if item.get("updating"):
+        raise HTTPException(status_code=409, detail="The server is updating.")
     platform = str(payload.get("platform", "")).lower()
     project = payload.get("project") or {}
     project_id = str(project.get("project_id", ""))
@@ -961,6 +1603,8 @@ async def add_mod(server_id: str, payload: dict[str, Any]):
             stop_container(server_id, remove=True)
             run_container(server_id)
         job_id = submit_job(server_id, "install mod", apply_mod)
+    else:
+        stop_container(server_id, remove=True)
     return {"server": public_server(item), "job_id": job_id}
 
 
@@ -969,6 +1613,8 @@ async def remove_mod(server_id: str, platform: str, project_id: str):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    if item.get("updating"):
+        raise HTTPException(status_code=409, detail="The server is updating.")
     item["mods"] = [m for m in item.get("mods", []) if not (m.get("platform") == platform.lower() and m.get("project_id") == project_id)]
     was_running = item.get("desired_state") == "running"
     write_json(config_path(server_id), item)
@@ -978,6 +1624,8 @@ async def remove_mod(server_id: str, platform: str, project_id: str):
             stop_container(server_id, remove=True)
             run_container(server_id)
         job_id = submit_job(server_id, "remove mod", apply_mods)
+    else:
+        stop_container(server_id, remove=True)
     return {"server": public_server(item), "job_id": job_id}
 
 
@@ -987,13 +1635,42 @@ async def delete_server(server_id: str):
     item = read_json(path / "server.json")
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    if item.get("updating"):
+        raise HTTPException(status_code=409, detail="The server is updating.")
+    item["deleting"] = True
+    write_json(path / "server.json", item)
+    await close_gateway(server_id)
 
     def remove_server():
-        stop_container(server_id, remove=True, timeout=120)
-        shutil.rmtree(path)
+        try:
+            stop_container(server_id, remove=True, timeout=120)
+            shutil.rmtree(path)
+        except Exception:
+            failed = read_json(path / "server.json")
+            if failed:
+                failed["deleting"] = False
+                write_json(path / "server.json", failed)
+            raise
 
     job_id = submit_job(server_id, "remove server", remove_server)
     return {"job_id": job_id, "deleted": server_id}
+
+
+@app.post("/api/servers/{server_id}/console")
+async def send_console_command(server_id: str, payload: dict[str, Any]):
+    if not read_json(config_path(server_id)):
+        raise HTTPException(status_code=404, detail="Server not found.")
+    command = str(payload.get("command", "")).strip()
+    if not command or len(command) > 512 or any(ord(char) < 32 or ord(char) == 127 for char in command):
+        raise HTTPException(status_code=422, detail="Enter a single server command of up to 512 characters.")
+    status, _ = current_status(server_id)
+    if status != "running":
+        raise HTTPException(status_code=409, detail="Start the server before sending commands.")
+    try:
+        output = await asyncio.to_thread(rcon_output, server_id, command)
+    except (DockerException, RuntimeError) as err:
+        raise HTTPException(status_code=503, detail=f"Could not reach the server console: {err}")
+    return {"command": command, "output": output}
 
 
 @app.get("/api/servers/{server_id}/logs", response_class=PlainTextResponse)

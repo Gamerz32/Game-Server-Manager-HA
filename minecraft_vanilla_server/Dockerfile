@@ -1,23 +1,14 @@
-FROM ghcr.io/hassio-addons/debian-base:stable
+FROM python:3.12-slim
 
-SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1
 
-RUN apt-get update \
-  && apt-get install -y --no-install-recommends \
-    ca-certificates \
-    curl \
-    jq \
-    bash \
-    coreutils \
-    sed \
-    grep \
-    findutils \
-    tar \
-    xz-utils \
-  && apt-get clean \
-  && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r /app/requirements.txt
 
+COPY manager /app/manager
 COPY run.sh /run.sh
-RUN chmod +x /run.sh
+RUN chmod 0755 /run.sh
 
-CMD ["/run.sh"]
+ENTRYPOINT ["/run.sh"]

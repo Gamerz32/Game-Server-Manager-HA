@@ -1,118 +1,31 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/cyclemat/Home-Assistant-Gameservers-ADDONS/main/assets/banner.png" alt="Home Assistant Game Servers Add-ons" width="80%">
-</p>
+# Minecraft Server Manager for Home Assistant
 
-<h1 align="center">🎮 Home Assistant Game Servers Add-ons</h1>
-<h3 align="center">Run your own game servers at home – simple, private & fully automated</h3>
+This fork contains one Home Assistant add-on: **Minecraft Server Manager**. It provides an ingress dashboard for creating and managing multiple Minecraft Java servers, each running in its own [itzg/minecraft-server](https://docker-minecraft-server.readthedocs.io/en/latest/) container.
 
-<p align="center">
-  <img src="https://img.shields.io/badge/Platform-Home%20Assistant-blue.svg" alt="Platform: Home Assistant">
-  <img src="https://img.shields.io/badge/Architecture-amd64-blue.svg" alt="Architecture: amd64">
-  <img src="https://img.shields.io/badge/Category-ADD--ON-yellow">
-  <img src="https://img.shields.io/badge/Type-Dedicated%20Server-red">
-  <img src="https://img.shields.io/badge/Status-Active%20Development-green.svg">
-</p>
+## Install
 
----
+Add this repository to **Settings → Apps → App Store → Repositories**:
 
-## 🚀 About This Repository
+https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS
 
-This repository provides **Home Assistant add-ons for running dedicated game servers** directly on **Home Assistant OS (HAOS)**.
+Then install **Minecraft Server Manager** from the app store.
 
-The goal is simple:
+## Dashboard features
 
-> **Enable everyone to host private game servers at home – without complicated setups, cloud providers, or external infrastructure.**
+- Create multiple independent servers and manage their status and logs.
+- Configure RAM, Java runtime, Minecraft version, and ports per server.
+- Choose Vanilla or supported server software and install Modrinth or CurseForge modpacks.
+- Search and install compatible Modrinth or CurseForge mods for supported mod loaders.
+- Keep Types, Mods, and Plugins tabs visible, with incompatible catalogs disabled; browse and install Modrinth or CurseForge plugins on Bukkit, Paper, and Purpur servers.
+- The “Bukkit” choice runs the maintained Paper engine, which supports Bukkit plugins; upstream [itzg documentation](https://docker-minecraft-server.readthedocs.io/en/latest/types-and-platforms/server-types/bukkit-spigot/) notes automated Bukkit downloads are no longer supported.
+- Use Home Assistant ingress to open the dashboard in the sidebar.
 
-All add-ons are designed to be:
-- 🔹 Easy to install
-- 🔹 Fully automated
-- 🔹 Persistent (data stored in `/share`)
-- 🔹 Safe to update & rebuild
-- 🔹 Suitable for 24/7 home servers
+See the [Minecraft add-on guide](https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server) for setup, backups, migration, and troubleshooting.
 
----
+## Docker access and security
 
-## 🎯 Why Home Assistant?
+The manager needs Docker API access to create and manage the separate game-server containers. This requires turning off Protection mode for the add-on. Docker API access can control containers on the Home Assistant host, so enable it only if you accept that access. See the [Home Assistant security guide](https://developers.home-assistant.io/docs/apps/guides/security/).
 
-Home Assistant already runs on many home servers and mini PCs.  
-Why not use that power to also host **game servers**?
+## License and trademarks
 
-Benefits:
-- 🏠 Everything runs **locally at home**
-- 🔐 Full control over your data
-- ♻️ Restart-safe & update-friendly
-- ⚡ Integrated into your existing HA ecosystem
-
----
-
-## 📦 Available Game Server Add-ons
-
-Each game server is provided as its own Home Assistant add-on with:
-- SteamCMD integration
-- Persistent data storage
-- Automatic updates (optional)
-- Clean startup & shutdown handling
-
-Examples:
-- 🛡️ Valheim Dedicated Server
-- 🧟 Palworld Dedicated Server
-- 🚀 StarRupture Dedicated Server  
-*(more coming)*
-
----
-
-## 🧩 One-Click Installation (Home Assistant)
-
-You can add this repository directly to your **Home Assistant Add-on Store**:
-
-### 👉 Add Repository
-https://github.com/cyclemat/Home-Assistant-Gameservers-ADDONS
-
-
-In Home Assistant:
-1. Go to **Settings → Add-ons → Add-on Store**
-2. Click **⋮ → Repositories**
-3. Paste the URL above
-4. Install your desired game server add-on
-
----
-
-## ⚠️ Disclaimer
-
-This project is a **community-driven, private hobby project**.
-
-- I am **not affiliated with any game developer or publisher**
-- All game names, trademarks, and copyrights belong to their respective owners
-- These add-ons only provide **dedicated server wrappers**
-- You must own the respective games and follow their license terms
-
----
-
-## ❤️ Support & Donations
-
-All add-ons are **free to use**.
-
-If you enjoy this project and want to support further development, you are welcome to leave a small donation — **completely optional**:
-
-👉 **Donate via PayPal:** http://paypal.me/cyclemat
-
-No pressure, no ads, no paywalls.  
-Just open-source and passion ❤️
-
----
-
-## 🛠️ Feedback & Contributions
-
-- Issues and suggestions are welcome
-- Feel free to open pull requests
-- New game server ideas are always appreciated
-
----
-
-<p align="center">
-  <img src="https://raw.githubusercontent.com/cyclemat/Home-Assistant-Gameservers-ADDONS/main/assets/logo.png" width="200">
-</p>
-
-<p align="center">
-  <strong>Host your worlds. Your server. Your rules.</strong>
-</p>
+See [LICENSE](LICENSE). This community project is not affiliated with Minecraft, Mojang, Microsoft, Modrinth, CurseForge, or Home Assistant. Their names and marks belong to their respective owners.

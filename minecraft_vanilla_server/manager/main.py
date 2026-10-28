@@ -638,7 +638,7 @@ async def send_offline_status(reader: asyncio.StreamReader, writer: asyncio.Stre
         packet_id, offset = decode_varint(payload)
         if packet_id == 0:
             status = {
-                "version": {"name": "Minecraft Server Manager", "protocol": -1},
+                "version": {"name": "Game Server Manager", "protocol": -1},
                 "players": {"max": 0, "online": 0, "sample": []},
                 "description": {"text": message},
             }

@@ -182,6 +182,7 @@
 .game-tabs{display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--line);margin:15px 0 10px}.game-tab{position:relative;border:0;background:transparent;color:#f1f4f5;padding:9px 13px;font-size:13px;font-weight:650}.game-tab::after{content:"";position:absolute;bottom:-1px;left:10px;right:10px;height:2px;border-radius:2px;background:var(--blue)}.game-tabs-note{margin-left:auto;color:var(--muted);font-size:11px;font-style:italic}@media(max-width:480px){.game-tabs{align-items:flex-start;flex-wrap:wrap}.game-tabs-note{margin-left:0;padding:0 12px 10px}}
 
 /* HA Plus Islands: Lovelace cards with contained, image-led accents. */
+.card-art>.status-pill{position:relative;z-index:1}
 .server-card{isolation:isolate;border-radius:14px;box-shadow:0 9px 30px #0005;transition:border-color .18s,box-shadow .18s}
 .server-card:hover{border-color:color-mix(in srgb,var(--server-accent,#79bce6) 48%,var(--line));box-shadow:0 10px 32px color-mix(in srgb,var(--server-accent,#79bce6) 18%,#0006)}
 .card-art{position:relative;isolation:isolate;overflow:hidden;border-radius:14px 14px 0 0;background:radial-gradient(circle at 13% 48%,color-mix(in srgb,var(--server-accent,#79bce6) 34%,transparent),transparent 39%),linear-gradient(130deg,color-mix(in srgb,var(--server-accent,#79bce6) 22%,#243746),#202326 72%)}

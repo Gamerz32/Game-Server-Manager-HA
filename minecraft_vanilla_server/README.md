@@ -1,69 +1,77 @@
-# Minecraft Java Server for Home Assistant
+# Minecraft Server Manager
 
-A Home Assistant add-on for Java Edition servers. It uses the maintained itzg/minecraft-server runtime and exposes the main server settings through the Home Assistant add-on Configuration tab.
+Manage as many separate Minecraft Java servers as your Home Assistant hardware can run. The manager provides a Home Assistant ingress dashboard and starts one maintained [itzg/minecraft-server](https://docker-minecraft-server.readthedocs.io/en/latest/) container per server.
 
-## Features
+## What the dashboard does
 
-- Vanilla, Paper, Purpur, Fabric, Forge, NeoForge, and Quilt server software
-- Modrinth modpacks by slug, ID, project or version URL, or .mrpack URL
-- Automatically managed CurseForge modpacks by project URL or slug
-- Custom server JAR URLs
-- Java auto, 17, 21, or 25
-- Minecraft version, initial and maximum memory, MOTD, player limit, difficulty, game mode, account verification, PvP, and world distances configured in Home Assistant
-- Persistent worlds in the add-on's private storage
-- Graceful stop and cold Home Assistant backups
+- Shows a card for every server with status, port, Minecraft version, and memory.
+- Uses the gear at the lower left of each card to edit minimum RAM, maximum RAM, port, Java runtime, Minecraft version, and server name.
+- Opens the server’s **Types** and **Mods** tabs from the lower right of its card.
+- Offers Vanilla first, plus Paper, Purpur, Fabric, Forge, NeoForge, and Quilt.
+- Searches Modrinth and CurseForge for modpacks and compatible standalone mods.
+- Opens a rounded detail dialog with catalog artwork, description, versions, and an install button.
+- Includes a first-run wizard that asks the user to accept the Minecraft EULA and choose a type for the first server.
+- Keeps each server’s world and settings in its own directory inside the app’s backed-up data folder.
 
-The first installation builds its image on the Home Assistant device. This can take a while, especially on a small device. The base runtime supports amd64 and aarch64.
+This is an ingress panel, so it can be added to the Home Assistant sidebar. Start the app, open its page, choose **Show in sidebar**, and select **Minecraft Servers**.
 
-## Install
+## Docker access and security
 
-1. In Home Assistant, open Settings → Apps → App Store (called Add-on Store in older Home Assistant releases).
-2. Open the menu and choose Repositories.
-3. Add https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS.
-4. Install Minecraft Java Server.
-5. Open its Configuration tab and review the settings.
-6. Read the Minecraft EULA at https://aka.ms/MinecraftEULA, enable Accept the Minecraft EULA, save, then start the app.
+The manager creates, starts, stops, and removes Docker containers. Home Assistant exposes the Docker API only when the app has Docker API access enabled and Protection mode is off. Docker API access grants control of the host’s containers, so Home Assistant assigns this app its lowest security rating. Enable it only if you accept that access. See [Home Assistant app security](https://developers.home-assistant.io/docs/apps/guides/security/).
 
-## Configure a standard server
+The manager’s web interface accepts connections through Home Assistant ingress. The Minecraft server containers do not receive the Docker socket. Each server port is published directly on the Home Assistant host.
 
-The defaults run a current vanilla release with 1 GB initial and 4 GB maximum Java memory. The auto option follows the Java runtime bundled with the latest upstream server image; it currently uses Java 25. Auto does not inspect a selected game version or modpack and switch to an older runtime. Select Java 17 or 21 when an older version or pack requires it. Some pre-1.18 Forge packs require Java 8 and are outside this add-on's supported Java choices. The required runtime is set by the Minecraft version, loader, and pack.
+## Install and first run
 
-The Minecraft container port stays at 25565. To change the host port, open the app's Network settings in Home Assistant. Forward the selected host port on your router only if players outside your home network need to connect.
+1. Add https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS to **Settings → Apps → App Store → Repositories**.
+2. Install **Minecraft Server Manager**.
+3. Turn off Protection mode for this app, then start it.
+4. Open **Minecraft Servers** from the sidebar or the app’s **Open Web UI** button.
+5. Review and accept the Minecraft EULA in the first-run dialog.
+6. Choose Vanilla, server software, or a Modrinth or CurseForge pack, then set the name, port, Java runtime, and RAM.
 
-## Configure a modpack
+The EULA is shown at [aka.ms/MinecraftEULA](https://aka.ms/MinecraftEULA). The manager does not create a server before the user accepts it.
 
-### Modrinth
+## Servers, ports, and memory
 
-- Set Server software or modpack platform to MODRINTH.
-- Enter a Modrinth project slug, project ID, project URL, version URL, or hosted .mrpack URL in Modpack.
-- To pin a version, use the URL for that specific version.
+Each server runs in a separate itzg/minecraft-server container, with a distinct directory under /data/servers/. Choose a unique TCP port for each instance; port 25565 is the usual default. The selected port must also be unused by Home Assistant or another device using the host. Router port forwarding may be needed for players outside your home network.
 
-### CurseForge
+There is no artificial server-count limit. CPU, memory, storage, and network capacity on the Home Assistant host are the limits. The sum of all configured server memory can exceed the hardware’s physical RAM, so set these values conservatively.
 
-- Set Server software or modpack platform to AUTO_CURSEFORGE.
-- Enter the modpack URL or slug in Modpack.
-- The upstream Java 17+ image includes a CurseForge API key. If CurseForge rate-limits requests, add your own key in CurseForge API key.
+The **Auto** Java option uses itzg’s **latest** image tag. That tag follows the Java version required by the newest Minecraft release. Java 8, 17, 21, and 25 are available when a modpack or older Minecraft release needs a specific runtime. Check [itzg’s Java tag table](https://docker-minecraft-server.readthedocs.io/en/latest/versions/java/) and the pack’s requirements before pinning a version.
 
-Only modpacks with server files or server-install support can run as dedicated servers. The selected Java version and memory must also meet the pack's requirements.
+## Modpacks and mods
 
-## Existing vanilla add-on users
+The Types tab can install Modrinth modpacks with TYPE=MODRINTH and CurseForge packs with TYPE=AUTO_CURSEFORGE. The manager stores the selected project and version so the itzg container installs it on startup. Some packs restrict automated file access or have files that are not compatible with a dedicated server.
 
-Version 1.0.0 changes the server runtime and moves data from the old shared folder into the add-on's persistent private storage. On first start, the app copies files from /share/minecraft-vanilla (or the configured Previous add-on data folder) if it finds an old server. It keeps the original folder untouched as a backup. If it finds conflicting files in the destination, it stops and asks you to resolve the conflict instead of overwriting anything.
+The Mods tab is available for Fabric, Forge, NeoForge, and Quilt. It searches the same two catalogs, filters by the server’s Minecraft version and loader where the provider supports it, and pins the selected project version or CurseForge file. Paper and Purpur use plugins, which are not managed by this Mods tab.
 
-The EULA checkbox starts disabled. Review it and enable it before starting, including when upgrading an existing server.
+Modrinth searches do not need an API key. CurseForge browsing needs a key created in the CurseForge developer console; save it in the dashboard’s catalog settings. The key is stored in the app’s private settings file and passed to a server container if required by the chosen Java image.
 
-## Settings
+Changing a server’s type recreates its container while preserving its data directory. A pack or loader change can make an existing world or installed mods incompatible; the dashboard asks for confirmation before applying the change.
 
-| Setting | Purpose |
-| --- | --- |
-| server_type | Server software, modpack platform, or custom JAR mode |
-| mc_version | LATEST, a release such as 1.21.1, or a supported snapshot |
-| java_version | auto, 17, 21, or 25 |
-| modpack | Modrinth project/version reference or CurseForge project reference |
-| xms_mb / xmx_mb | Initial and maximum Java memory |
-| motd, max_players | Server list message and player limit |
-| difficulty, game_mode, online_mode, pvp | Common server properties |
-| view_distance, simulation_distance | World rendering and simulation distances |
-| server_jar_url | Custom server JAR URL when using CUSTOM |
+## Backups and migration
 
-Use the Home Assistant app log for live server output. World, configuration, and downloaded server files remain in the app's persistent data folder and are included in Home Assistant backups.
+Every world is stored below the add-on’s /data directory, so Home Assistant app backups include the managed servers. Backups are configured as cold backups; when Home Assistant stops the manager for a backup, it asks the Minecraft containers to stop cleanly first.
+
+On upgrade from the previous Vanilla add-on, the manager looks for /share/minecraft-vanilla, copies that data into a managed server folder, and keeps the original /share files intact. The imported server starts stopped until the user completes the EULA step. The old folder is not deleted.
+
+Removing a server in the dashboard deletes that server’s container and data directory after confirmation. Downloaded Docker images may remain cached on the host.
+
+## Troubleshooting
+
+- **Docker unavailable:** turn off Protection mode for this app and restart it.
+- **Port already assigned:** edit the server’s port in its gear settings and choose a free TCP port.
+- **CurseForge search fails:** add or replace the CurseForge API key in catalog settings.
+- **Server or pack install fails:** open the server’s logs from its card. The chosen modpack may require a different Java version or may not provide a server-compatible pack.
+
+## References
+
+- [itzg Minecraft server documentation](https://docker-minecraft-server.readthedocs.io/en/latest/)
+- [itzg data directory](https://docker-minecraft-server.readthedocs.io/en/latest/data-directory/)
+- [itzg Modrinth modpacks](https://docker-minecraft-server.readthedocs.io/en/latest/types-and-platforms/mod-platforms/modrinth-modpacks/)
+- [itzg Auto CurseForge](https://docker-minecraft-server.readthedocs.io/en/latest/types-and-platforms/mod-platforms/auto-curseforge/)
+- [itzg Modrinth mods](https://docker-minecraft-server.readthedocs.io/en/latest/mods-and-plugins/modrinth/)
+- [itzg CurseForge files](https://docker-minecraft-server.readthedocs.io/en/latest/mods-and-plugins/curseforge-files/)
+- [Home Assistant ingress](https://developers.home-assistant.io/docs/apps/guides/ingress/)
+- [Home Assistant app security](https://developers.home-assistant.io/docs/apps/guides/security/)

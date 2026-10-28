@@ -1587,6 +1587,15 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 @app.middleware("http")
 async def ingress_only(request: Request, call_next):
+    # Some Home Assistant ingress versions forward the configured "/" entry as "//".
+    # Collapse duplicate leading slashes so the root page and API routes match.
+    path = request.scope.get("path", "")
+    if path.startswith("//"):
+        request.scope["path"] = "/" + path.lstrip("/")
+        raw_path = request.scope.get("raw_path")
+        if isinstance(raw_path, bytes) and raw_path.startswith(b"//"):
+            request.scope["raw_path"] = b"/" + raw_path.lstrip(b"/")
+
     peer = request.client.host if request.client else ""
     if peer != INGRESS_PEER:
         return JSONResponse({"detail": "This interface is only available through Home Assistant ingress."}, status_code=403)

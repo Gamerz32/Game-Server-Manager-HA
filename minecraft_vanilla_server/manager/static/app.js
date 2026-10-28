@@ -131,7 +131,7 @@ function consoleView(id){var s=state.servers.find(function(x){return x.id===id;}
 function leaveManage(){state.active=null;mainView.classList.remove("hidden");manageView.classList.add("hidden");renderServers();}
 function removeServer(){var s=state.servers.find(function(x){return x.id===state.active;});if(!s)return;if(!confirm("Remove “"+s.name+"”? Its container and saved world directory will be permanently deleted."))return;var id=s.id;leaveManage();perform("Removing server",function(){return api("servers/"+encodeURIComponent(id),{method:"DELETE"});});}
 function closeServerMenus(){document.querySelectorAll(".server-action-menu").forEach(function(menu){menu.classList.add("hidden");});document.querySelectorAll(".menu-trigger").forEach(function(button){button.setAttribute("aria-expanded","false");});}
-function action(a,b){b=b||{dataset:{}};if(!b.dataset)b.dataset={};var id=b.dataset.id||state.active;
+function action(a,b){b=b||{dataset:{}};if(!b.dataset)b.dataset={};if(a!=="server-menu")closeServerMenus();var id=b.dataset.id||state.active;
 if(a==="add-server"){if(!state.eula)showEula();else openWizard();}
 else if(a==="global-settings")globalSettings();else if(a==="back")leaveManage();else if(a==="settings")openSettings(id);else if(a==="console"||a==="logs")consoleView(id);else if(a==="manage")manage(id,"types");
 else if(a==="server-menu"){var wrap=b.closest(".server-action-wrap"),menu=wrap&&wrap.querySelector(".server-action-menu"),wasOpen=menu&&!menu.classList.contains("hidden");closeServerMenus();if(menu){menu.classList.toggle("hidden",!!wasOpen);b.setAttribute("aria-expanded",wasOpen?"false":"true");}}

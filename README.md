@@ -16,6 +16,8 @@ Then install **Minecraft Server Manager** from the app store.
 - Configure RAM, Java runtime, Minecraft version, and ports per server.
 - Choose Vanilla or supported server software and install Modrinth or CurseForge modpacks.
 - Search and install compatible Modrinth or CurseForge mods for supported mod loaders.
+- Keep Types, Mods, and Plugins tabs visible, with incompatible catalogs disabled; browse and install Modrinth or CurseForge plugins on Bukkit, Paper, and Purpur servers.
+- The “Bukkit” choice runs the maintained Paper engine, which supports Bukkit plugins; upstream [itzg documentation](https://docker-minecraft-server.readthedocs.io/en/latest/types-and-platforms/server-types/bukkit-spigot/) notes automated Bukkit downloads are no longer supported.
 - Use Home Assistant ingress to open the dashboard in the sidebar.
 
 See the [Minecraft add-on guide](https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server) for setup, backups, migration, and troubleshooting.

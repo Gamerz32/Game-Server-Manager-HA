@@ -7,7 +7,8 @@ import logging
 import os
 import re
 import secrets
-import shutilimport threading
+import shutil
+import threading
 import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor
@@ -34,7 +35,7 @@ SERVER_IMAGE = "itzg/minecraft-server"
 MANAGER_LABEL = "io.gamerz32.minecraft-manager"
 INGRESS_PEER = "172.30.32.2"
 MC_GAME_ID = 432
-CF_CLASS_IDS = {"modpack": 4471, "mod": 6}
+CF_CLASS_IDS = {"modpack": 4471, "mod": 6, "plugin": 5}
 MODRINTH_BASE = "https://api.modrinth.com/v2"
 CURSEFORGE_BASE = "https://api.curseforge.com/v1"
 JAVA_TAGS = {"auto": "latest", "8": "java8", "17": "java17", "21": "java21", "25": "java25"}
@@ -42,9 +43,10 @@ UPDATE_CHECK_INTERVAL = 4 * 60 * 60
 MAINTENANCE_INTERVAL = 60
 UPDATE_DISCONNECT_REASON = "The Server is Updating, Please Wait"
 GATEWAYS: dict[str, tuple[asyncio.AbstractServer, int]] = {}
-MAINTENANCE_TASK: asyncio.Task | None = None {}
-SERVER_TYPES = {"VANILLA", "PAPER", "PURPUR", "FABRIC", "FORGE", "NEOFORGE", "QUILT", "MODRINTH", "AUTO_CURSEFORGE"}
+MAINTENANCE_TASK: asyncio.Task | None = None
+SERVER_TYPES = {"VANILLA", "BUKKIT", "PAPER", "PURPUR", "FABRIC", "FORGE", "NEOFORGE", "QUILT", "MODRINTH", "AUTO_CURSEFORGE"}
 MOD_LOADERS = {"FABRIC", "FORGE", "NEOFORGE", "QUILT"}
+PLUGIN_SERVER_TYPES = {"BUKKIT", "PAPER", "PURPUR"}
 CF_LOADER_IDS = {"FORGE": 1, "FABRIC": 4, "QUILT": 5, "NEOFORGE": 6}
 CF_LOADER_NAMES = {value: key.lower() for key, value in CF_LOADER_IDS.items()}
 MINECRAFT_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
@@ -299,7 +301,7 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
 def env_for_server(item: dict[str, Any]) -> dict[str, str]:
     env = {
         "EULA": "TRUE",
-        "TYPE": str(item.get("server_type", "VANILLA")),
+        "TYPE": "PAPER" if str(item.get("server_type", "")).upper() == "BUKKIT" else str(item.get("server_type", "VANILLA")),
         "VERSION": str(item.get("minecraft_version", "LATEST")),
         "INIT_MEMORY": f"{item.get('min_ram_mb', 1024)}M",
         "MAX_MEMORY": f"{item.get('max_ram_mb', 4096)}M",
@@ -317,7 +319,7 @@ def env_for_server(item: dict[str, Any]) -> dict[str, str]:
         env["CF_SLUG"] = str(pack.get("slug") or pack.get("project_id"))
         if pack.get("file_id"):
             env["CF_FILE_ID"] = str(pack["file_id"])
-    modrinth_mods = []
+    modrinth_projects = []
     for mod in item.get("mods", []):
         if mod.get("platform") != "modrinth":
             continue
@@ -329,16 +331,32 @@ def env_for_server(item: dict[str, Any]) -> dict[str, str]:
         if version_id:
             project = f"{project}:{version_id}"
         if project:
-            modrinth_mods.append(project)
-    curseforge_mods = [
-        f"{mod.get('project_id')}:{mod.get('file_id')}"
-        for mod in item.get("mods", [])
-        if mod.get("platform") == "curseforge" and mod.get("project_id") and mod.get("file_id")
+            modrinth_projects.append(project)
+    if str(item.get("server_type", "")).upper() in PLUGIN_SERVER_TYPES:
+        for plugin in item.get("plugins", []):
+            if plugin.get("platform") != "modrinth":
+                continue
+            project = str(plugin.get("project_id", ""))
+            version_id = str(plugin.get("version_id", ""))
+            if version_id:
+                project = f"{project}:{version_id}"
+            if project:
+                modrinth_projects.append(project)
+    curseforge_files = [
+        f"{entry.get('project_id')}:{entry.get('file_id')}"
+        for entry in item.get("mods", [])
+        if entry.get("platform") == "curseforge" and entry.get("project_id") and entry.get("file_id")
     ]
-    if modrinth_mods:
-        env["MODRINTH_PROJECTS"] = "\n".join(modrinth_mods)
-    if curseforge_mods:
-        env["CURSEFORGE_FILES"] = "\n".join(curseforge_mods)
+    if str(item.get("server_type", "")).upper() in PLUGIN_SERVER_TYPES:
+        curseforge_files.extend(
+            f"{entry.get('project_id')}:{entry.get('file_id')}"
+            for entry in item.get("plugins", [])
+            if entry.get("platform") == "curseforge" and entry.get("project_id") and entry.get("file_id")
+        )
+    if modrinth_projects:
+        env["MODRINTH_PROJECTS"] = "\n".join(modrinth_projects)
+    if curseforge_files:
+        env["CURSEFORGE_FILES"] = "\n".join(curseforge_files)
     api_key = settings().get("curseforge_api_key", "").strip()
     if api_key:
         env["CF_API_KEY"] = api_key
@@ -840,8 +858,18 @@ def check_server_updates(server_id: str) -> None:
                 updates.append(update)
         except (httpx.HTTPError, ValueError, TypeError) as err:
             check_errors.append(f"{mod.get('title') or 'Mod'} check: {str(err)[:160]}")
+    if str(item.get("server_type", "")).upper() in PLUGIN_SERVER_TYPES:
+        for plugin in item.get("plugins", []):
+            current_id = str(plugin.get("version_id") or plugin.get("file_id") or "")
+            try:
+                update = provider_update(item, str(plugin.get("platform", "")), str(plugin.get("project_id", "")), current_id, "plugin")
+                if update:
+                    update["title"] = str(plugin.get("title") or update.get("name") or "Plugin")
+                    updates.append(update)
+            except (httpx.HTTPError, ValueError, TypeError) as err:
+                check_errors.append(f"{plugin.get('title') or 'Plugin'} check: {str(err)[:160]}")
     current_version = str(item.get("minecraft_version", "LATEST"))
-    can_advance_minecraft = item.get("server_type") in {"VANILLA", "PAPER", "PURPUR"} and not item.get("mods")
+    can_advance_minecraft = item.get("server_type") in {"VANILLA", "BUKKIT", "PAPER", "PURPUR"} and not item.get("mods") and not item.get("plugins")
     try:
         manifest_response = httpx.get(MINECRAFT_MANIFEST_URL, timeout=15)
         manifest_response.raise_for_status()
@@ -897,13 +925,14 @@ def apply_server_updates(server_id: str, force: bool = False) -> None:
                 if update.get("file_id"):
                     pack["file_id"] = update["file_id"]
                 item["modpack"] = pack
-            elif update.get("kind") == "mod":
-                for mod in item.get("mods", []):
-                    if mod.get("platform") == update.get("platform") and str(mod.get("project_id")) == str(update.get("project_id")):
+            elif update.get("kind") in {"mod", "plugin"}:
+                target_list = "plugins" if update.get("kind") == "plugin" else "mods"
+                for project in item.get(target_list, []):
+                    if project.get("platform") == update.get("platform") and str(project.get("project_id")) == str(update.get("project_id")):
                         if update.get("version_id"):
-                            mod["version_id"] = update["version_id"]
+                            project["version_id"] = update["version_id"]
                         if update.get("file_id"):
-                            mod["file_id"] = update["file_id"]
+                            project["file_id"] = update["file_id"]
         write_json(config_path(server_id), item)
         stop_container(server_id, remove=True, timeout=120)
         image = f"{SERVER_IMAGE}:{JAVA_TAGS.get(str(item.get('java_version', 'auto')), 'latest')}"
@@ -1078,9 +1107,10 @@ def modrinth_version_record(version: dict[str, Any], kind: str, game_version: st
         targets = [{"game_version": game, "loader": ""} for game in games]
     files = version.get("files", [])
     size = next((int(f.get("size", 0)) for f in files if f.get("primary")), int(files[0].get("size", 0)) if files else 0)
+    compatible = mod_compatibility(game_version, loader, games, loaders) if kind == "mod" else (game_version in games if kind == "plugin" and game_version else None)
     return {"id": str(version.get("id", "")), "number": str(version.get("version_number", "")),
         "name": str(version.get("name", "")), "game_versions": games, "loaders": loaders, "targets": targets,
-        "compatible": mod_compatibility(game_version, loader, games, loaders) if kind == "mod" else None,
+        "compatible": compatible,
         "version_type": str(version.get("version_type", "")), "date_published": str(version.get("date_published", "")),
         "downloads": int(version.get("downloads", 0)), "size": size}
 
@@ -1093,7 +1123,7 @@ def curseforge_version_record(version: dict[str, Any], kind: str, game_version: 
         loader_id = 0
     version_loader = CF_LOADER_NAMES.get(loader_id, "")
     targets = [{"game_version": game, "loader": version_loader} for game in games]
-    compatible = None if kind != "mod" or not game_version or not loader else (game_version in games and loader.lower() == version_loader)
+    compatible = (game_version in games and loader.lower() == version_loader) if kind == "mod" and game_version and loader else (game_version in games if kind == "plugin" and game_version else None)
     try:
         release_type = {1: "release", 2: "beta", 3: "alpha"}.get(int(version.get("releaseType", 0) or 0), "")
     except (TypeError, ValueError):
@@ -1172,6 +1202,37 @@ async def validate_mod_version(platform: str, project_id: str, version_id: str, 
     raise HTTPException(status_code=422, detail="Unsupported mod platform.")
 
 
+async def validate_plugin_version(platform: str, project_id: str, version_id: str, file_id: str, game_version: str) -> None:
+    if platform == "modrinth":
+        if not version_id:
+            raise HTTPException(status_code=422, detail="Select a Modrinth plugin version.")
+        async with httpx.AsyncClient(timeout=20, headers=modrinth_headers()) as client:
+            response = await client.get(f"{MODRINTH_BASE}/version/{version_id}")
+            response.raise_for_status()
+            version = response.json()
+        if str(version.get("project_id", "")) != project_id:
+            raise HTTPException(status_code=422, detail="The selected version does not belong to this plugin.")
+        if game_version not in version.get("game_versions", []):
+            raise HTTPException(status_code=409, detail="This plugin version does not support the server's Minecraft version.")
+        return
+    if platform == "curseforge":
+        if not file_id or not file_id.isdigit():
+            raise HTTPException(status_code=422, detail="Select a CurseForge plugin file version.")
+        key = settings().get("curseforge_api_key", "").strip()
+        if not key:
+            raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to use CurseForge.")
+        async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
+            response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/files/{file_id}")
+            response.raise_for_status()
+            version = response.json().get("data", {})
+        if str(version.get("modId", project_id)) != project_id:
+            raise HTTPException(status_code=422, detail="The selected file does not belong to this CurseForge plugin.")
+        if game_version not in curseforge_game_versions(version.get("gameVersions", [])):
+            raise HTTPException(status_code=409, detail="This CurseForge plugin file does not support the server's Minecraft version.")
+        return
+    raise HTTPException(status_code=422, detail="Unsupported plugin platform.")
+
+
 async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: int, sort: str) -> dict[str, Any]:
     index = {"downloads": "downloads", "updated": "updated"}[sort]
     params = {"query": query, "facets": json.dumps([[f"project_type:{kind}"]]), "limit": 24, "offset": offset, "index": index}
@@ -1179,16 +1240,17 @@ async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: i
         response = await client.get(f"{MODRINTH_BASE}/search", params=params)
         response.raise_for_status()
         data = response.json()
-    game = await resolve_minecraft_version(item) if kind == "mod" else ""
+    game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""
     loader = str(item.get("mod_loader", "")).lower()
     hits = []
     for project in data.get("hits", []):
         games = [str(v) for v in project.get("versions", [])]
         categories = [str(v).lower() for v in project.get("categories", [])]
+        compatible = mod_compatibility(game, loader, games, categories) if kind == "mod" else (game in games if kind == "plugin" and game else None)
         hits.append({"project_id": project["project_id"], "slug": project["slug"], "title": project["title"],
             "description": project["description"], "icon": project.get("icon_url", ""),
             "downloads": project.get("downloads", 0), "platform": "modrinth", "versions": games[:12],
-            "loaders": categories, "compatible": mod_compatibility(game, loader, games, categories) if kind == "mod" else None})
+            "loaders": categories, "compatible": compatible})
     return {"hits": hits, "total_hits": data.get("total_hits", 0)}
 
 
@@ -1203,7 +1265,7 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
         response = await client.get(f"{CURSEFORGE_BASE}/mods/search", params=params)
         response.raise_for_status()
         data = response.json()
-    game = await resolve_minecraft_version(item) if kind == "mod" else ""
+    game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""
     loader_id = CF_LOADER_IDS.get(str(item.get("mod_loader", "")).upper())
     hits = []
     for project in data.get("data", []):
@@ -1223,6 +1285,11 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
                 if game in {str(value) for value in file_games} and (loader_id is None or file_loader_id == loader_id):
                     compatible = True
                     break
+        elif kind == "plugin" and game:
+            compatible = any(
+                game in [str(value) for value in (file.get("gameVersion") if isinstance(file.get("gameVersion"), list) else [file.get("gameVersion")])]
+                for file in indexes if isinstance(file, dict) and file.get("gameVersion")
+            )
         hits.append({"project_id": str(project["id"]), "slug": project.get("slug", str(project["id"])),
             "title": project.get("name", "CurseForge project"), "description": project.get("summary", ""),
             "icon": (project.get("logo") or {}).get("url", ""), "downloads": project.get("downloadCount", 0),
@@ -1397,7 +1464,7 @@ async def create_server(payload: dict[str, Any]):
     item = {
         **clean, "id": server_id, "created_at": __import__("datetime").datetime.now().isoformat(),
         "server_type": kind, "mod_loader": mod_loader,
-        "modpack": modpack, "mods": [], "desired_state": "running", "job_state": "queued",
+        "modpack": modpack, "mods": [], "plugins": [], "desired_state": "running", "job_state": "queued",
         "last_player_seen": time.time(), "empty_since": None, "updates_available": [],
         "last_update_check": 0, "updating": False, "auto_paused": False, "auto_stopped": False,
     }
@@ -1518,7 +1585,7 @@ async def install_type(server_id: str, payload: dict[str, Any]):
     requested_version = str(payload.get("minecraft_version", item.get("minecraft_version", "LATEST"))).strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", requested_version):
         raise HTTPException(status_code=422, detail="Choose a valid Minecraft release or snapshot version.")
-    if kind in {"VANILLA", "PAPER", "PURPUR", *MOD_LOADERS}:
+    if kind in {"VANILLA", "BUKKIT", "PAPER", "PURPUR", *MOD_LOADERS}:
         item.update({"server_type": kind, "minecraft_version": requested_version,
             "modpack": None, "mod_loader": kind if kind in MOD_LOADERS else "", "mods": []})
     elif provider in {"modrinth", "curseforge"} and kind == "MODPACK":
@@ -1629,6 +1696,75 @@ async def remove_mod(server_id: str, platform: str, project_id: str):
     return {"server": public_server(item), "job_id": job_id}
 
 
+@app.post("/api/servers/{server_id}/plugins")
+async def add_plugin(server_id: str, payload: dict[str, Any]):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    if str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
+        raise HTTPException(status_code=409, detail="Choose Bukkit, Paper, or Purpur in the Types tab before adding plugins.")
+    if item.get("updating"):
+        raise HTTPException(status_code=409, detail="The server is updating.")
+    platform = str(payload.get("platform", "")).lower()
+    project = payload.get("project") or {}
+    project_id = str(project.get("project_id", ""))
+    if platform not in {"modrinth", "curseforge"} or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", project_id):
+        raise HTTPException(status_code=422, detail="Plugin details are missing.")
+    if platform == "curseforge" and not project_id.isdigit():
+        raise HTTPException(status_code=422, detail="CurseForge project ID must be numeric.")
+    version_id = str(payload.get("version_id") or "")
+    file_id = str(payload.get("file_id") or "")
+    if platform == "modrinth" and version_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", version_id):
+        raise HTTPException(status_code=422, detail="Modrinth version ID is invalid.")
+    if platform == "curseforge" and file_id and not file_id.isdigit():
+        raise HTTPException(status_code=422, detail="CurseForge file ID is invalid.")
+    game_version = await resolve_minecraft_version(item)
+    try:
+        await validate_plugin_version(platform, project_id, version_id, file_id, game_version)
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(status_code=502, detail=f"{platform.title()} returned HTTP {err.response.status_code} while checking plugin compatibility.")
+    except httpx.HTTPError as err:
+        raise HTTPException(status_code=502, detail=f"Could not verify plugin compatibility: {err}")
+    plugins = list(item.get("plugins", []))
+    if any(plugin.get("platform") == platform and plugin.get("project_id") == project_id for plugin in plugins):
+        return {"server": public_server(item), "job_id": None, "already_installed": True}
+    plugins.append({"platform": platform, "project_id": project_id, "version_id": version_id, "file_id": file_id,
+        "title": str(project.get("title", "Plugin"))[:120], "slug": str(project.get("slug", ""))[:120]})
+    item["plugins"] = plugins
+    was_running = item.get("desired_state") == "running"
+    write_json(config_path(server_id), item)
+    job_id = None
+    if was_running:
+        def apply_plugin():
+            stop_container(server_id, remove=True)
+            run_container(server_id)
+        job_id = submit_job(server_id, "install plugin", apply_plugin)
+    else:
+        stop_container(server_id, remove=True)
+    return {"server": public_server(item), "job_id": job_id}
+
+
+@app.delete("/api/servers/{server_id}/plugins/{platform}/{project_id}")
+async def remove_plugin(server_id: str, platform: str, project_id: str):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    if item.get("updating"):
+        raise HTTPException(status_code=409, detail="The server is updating.")
+    item["plugins"] = [plugin for plugin in item.get("plugins", []) if not (plugin.get("platform") == platform.lower() and plugin.get("project_id") == project_id)]
+    was_running = item.get("desired_state") == "running"
+    write_json(config_path(server_id), item)
+    job_id = None
+    if was_running:
+        def apply_plugins():
+            stop_container(server_id, remove=True)
+            run_container(server_id)
+        job_id = submit_job(server_id, "remove plugin", apply_plugins)
+    else:
+        stop_container(server_id, remove=True)
+    return {"server": public_server(item), "job_id": job_id}
+
+
 @app.delete("/api/servers/{server_id}")
 async def delete_server(server_id: str):
     path = server_dir(server_id)
@@ -1712,7 +1848,7 @@ async def minecraft_versions(channel: str = "all"):
 
 @app.get("/api/catalog")
 async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", offset: int = 0, sort: str = "downloads"):
-    if kind not in {"mod", "modpack"} or platform not in {"modrinth", "curseforge"}:
+    if kind not in {"mod", "modpack", "plugin"} or platform not in {"modrinth", "curseforge"}:
         raise HTTPException(status_code=422, detail="Choose Modrinth or CurseForge and a supported category.")
     if len(q) > 100 or offset < 0:
         raise HTTPException(status_code=422, detail="Search text or page offset is invalid.")
@@ -1723,6 +1859,8 @@ async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", of
         raise HTTPException(status_code=404, detail="Server not found.")
     if kind == "mod" and item.get("mod_loader") not in MOD_LOADERS:
         raise HTTPException(status_code=409, detail="Select a mod loader such as Fabric or Forge in Types before browsing mods.")
+    if kind == "plugin" and str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
+        raise HTTPException(status_code=409, detail="Select Bukkit, Paper, or Purpur in Types before browsing plugins.")
     try:
         return await (modrinth_search(kind, q, item, offset, sort) if platform == "modrinth" else curseforge_search(kind, q, item, offset, sort))
     except HTTPException:
@@ -1735,7 +1873,7 @@ async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", of
 
 @app.get("/api/catalog/{platform}/{project_id}")
 async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", server_id: str = "", offset: int = 0):
-    if platform not in {"modrinth", "curseforge"} or kind not in {"mod", "modpack"}:
+    if platform not in {"modrinth", "curseforge"} or kind not in {"mod", "modpack", "plugin"}:
         raise HTTPException(status_code=422, detail="Unsupported catalog item.")
     if offset < 0:
         raise HTTPException(status_code=422, detail="Version page offset cannot be negative.")
@@ -1746,7 +1884,9 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
         raise HTTPException(status_code=422, detail="Catalog project ID is invalid.")
     if platform == "curseforge" and not project_id.isdigit():
         raise HTTPException(status_code=422, detail="CurseForge project ID must be numeric.")
-    game = await resolve_minecraft_version(item) if kind == "mod" else ""
+    if kind == "plugin" and str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
+        raise HTTPException(status_code=409, detail="Select Bukkit, Paper, or Purpur in Types before browsing plugins.")
+    game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""
     loader = str(item.get("mod_loader", "")).lower()
     try:
         if platform == "modrinth":

@@ -3,116 +3,47 @@
 </p>
 
 <h1 align="center">🎮 Home Assistant Game Servers Add-ons</h1>
-<h3 align="center">Run your own game servers at home – simple, private & fully automated</h3>
+<h3 align="center">Run game servers at home with Home Assistant</h3>
 
 <p align="center">
   <img src="https://img.shields.io/badge/Platform-Home%20Assistant-blue.svg" alt="Platform: Home Assistant">
-  <img src="https://img.shields.io/badge/Architecture-amd64-blue.svg" alt="Architecture: amd64">
-  <img src="https://img.shields.io/badge/Category-ADD--ON-yellow">
-  <img src="https://img.shields.io/badge/Type-Dedicated%20Server-red">
-  <img src="https://img.shields.io/badge/Status-Active%20Development-green.svg">
+  <img src="https://img.shields.io/badge/Architecture-amd64%20%7C%20aarch64-blue.svg" alt="Supported architectures">
+  <img src="https://img.shields.io/badge/Category-ADD--ON-yellow" alt="Home Assistant add-on repository">
 </p>
 
 ---
 
-## 🚀 About This Repository
+## About
 
-This repository provides **Home Assistant add-ons for running dedicated game servers** directly on **Home Assistant OS (HAOS)**.
+This repository provides Home Assistant add-ons for dedicated game servers on Home Assistant OS.
 
-The goal is simple:
+## Available game server add-ons
 
-> **Enable everyone to host private game servers at home – without complicated setups, cloud providers, or external infrastructure.**
+- **Minecraft Server Manager** — create and manage multiple Vanilla, modded, or modpack servers from a Home Assistant ingress dashboard.
+- Valheim Dedicated Server
+- Palworld Dedicated Server
+- StarRupture Dedicated Server
 
-All add-ons are designed to be:
-- 🔹 Easy to install
-- 🔹 Fully automated
-- 🔹 Persistent (data retained by Home Assistant across restarts)
-- 🔹 Safe to update & rebuild
-- 🔹 Suitable for 24/7 home servers
+## Install
 
----
+Add this repository to Home Assistant:
 
-## 🎯 Why Home Assistant?
-
-Home Assistant already runs on many home servers and mini PCs.  
-Why not use that power to also host **game servers**?
-
-Benefits:
-- 🏠 Everything runs **locally at home**
-- 🔐 Full control over your data
-- ♻️ Restart-safe & update-friendly
-- ⚡ Integrated into your existing HA ecosystem
-
----
-
-## 📦 Available Game Server Add-ons
-
-Each game server is provided as its own Home Assistant add-on with:
-- Server-specific setup and launch automation
-- Persistent data storage
-- Clean startup and shutdown handling
-
-Examples:
-- ⛏️ Minecraft Java Server (vanilla, server software, and modpacks)
-- 🛡️ Valheim Dedicated Server
-- 🧟 Palworld Dedicated Server
-- 🚀 StarRupture Dedicated Server  
-*(more coming)*
-
----
-
-## 🧩 One-Click Installation (Home Assistant)
-
-You can add this repository directly to your **Home Assistant Add-on Store**:
-
-### 👉 Add Repository
 https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS
 
+In Home Assistant, open **Settings → Apps → App Store → Repositories**, then paste the repository URL.
 
-In Home Assistant:
-1. Go to **Settings → Add-ons → Add-on Store**
-2. Click **⋮ → Repositories**
-3. Paste the URL above
-4. Install your desired game server add-on
+## Minecraft Server Manager
 
----
+The Minecraft app adds a sidebar panel for multiple servers, Modrinth and CurseForge catalogs, server settings, and mod management. It requires Docker API access with Protection mode off so that it can create separate Minecraft containers. Read the [Minecraft add-on guide](https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server) for setup and security details.
 
-## ⚠️ Disclaimer
+## Disclaimer
 
-This project is a **community-driven, private hobby project**.
+This is a community hobby project and is not affiliated with Minecraft, Mojang, Microsoft, Modrinth, or CurseForge. All game names, trademarks, and copyrights belong to their respective owners.
 
-- I am **not affiliated with any game developer or publisher**
-- All game names, trademarks, and copyrights belong to their respective owners
-- These add-ons only provide **dedicated server wrappers**
-- You must own the respective games and follow their license terms
+## Support and contributions
 
----
-
-## ❤️ Support & Donations
-
-All add-ons are **free to use**.
-
-If you enjoy this project and want to support further development, you are welcome to leave a small donation — **completely optional**:
-
-👉 **Donate via PayPal:** http://paypal.me/cyclemat
-
-No pressure, no ads, no paywalls.  
-Just open-source and passion ❤️
-
----
-
-## 🛠️ Feedback & Contributions
-
-- Issues and suggestions are welcome
-- Feel free to open pull requests
-- New game server ideas are always appreciated
-
----
+Issues, suggestions, and contributions are welcome.
 
 <p align="center">
-  <img src="https://raw.githubusercontent.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/main/assets/logo.png" width="200">
-</p>
-
-<p align="center">
-  <strong>Host your worlds. Your server. Your rules.</strong>
+  <img src="https://raw.githubusercontent.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/main/assets/logo.png" width="200" alt="Home Assistant Game Servers">
 </p>

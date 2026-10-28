@@ -1,49 +1,29 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/main/assets/banner.png" alt="Home Assistant Game Servers Add-ons" width="80%">
-</p>
+# Minecraft Server Manager for Home Assistant
 
-<h1 align="center">🎮 Home Assistant Game Servers Add-ons</h1>
-<h3 align="center">Run game servers at home with Home Assistant</h3>
-
-<p align="center">
-  <img src="https://img.shields.io/badge/Platform-Home%20Assistant-blue.svg" alt="Platform: Home Assistant">
-  <img src="https://img.shields.io/badge/Architecture-amd64%20%7C%20aarch64-blue.svg" alt="Supported architectures">
-  <img src="https://img.shields.io/badge/Category-ADD--ON-yellow" alt="Home Assistant add-on repository">
-</p>
-
----
-
-## About
-
-This repository provides Home Assistant add-ons for dedicated game servers on Home Assistant OS.
-
-## Available game server add-ons
-
-- **Minecraft Server Manager** — create and manage multiple Vanilla, modded, or modpack servers from a Home Assistant ingress dashboard.
-- Valheim Dedicated Server
-- Palworld Dedicated Server
-- StarRupture Dedicated Server
+This fork contains one Home Assistant add-on: **Minecraft Server Manager**. It provides an ingress dashboard for creating and managing multiple Minecraft Java servers, each running in its own [itzg/minecraft-server](https://docker-minecraft-server.readthedocs.io/en/latest/) container.
 
 ## Install
 
-Add this repository to Home Assistant:
+Add this repository to **Settings → Apps → App Store → Repositories**:
 
 https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS
 
-In Home Assistant, open **Settings → Apps → App Store → Repositories**, then paste the repository URL.
+Then install **Minecraft Server Manager** from the app store.
 
-## Minecraft Server Manager
+## Dashboard features
 
-The Minecraft app adds a sidebar panel for multiple servers, Modrinth and CurseForge catalogs, server settings, and mod management. It requires Docker API access with Protection mode off so that it can create separate Minecraft containers. Read the [Minecraft add-on guide](https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server) for setup and security details.
+- Create multiple independent servers and manage their status and logs.
+- Configure RAM, Java runtime, Minecraft version, and ports per server.
+- Choose Vanilla or supported server software and install Modrinth or CurseForge modpacks.
+- Search and install compatible Modrinth or CurseForge mods for supported mod loaders.
+- Use Home Assistant ingress to open the dashboard in the sidebar.
 
-## Disclaimer
+See the [Minecraft add-on guide](https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server) for setup, backups, migration, and troubleshooting.
 
-This is a community hobby project and is not affiliated with Minecraft, Mojang, Microsoft, Modrinth, or CurseForge. All game names, trademarks, and copyrights belong to their respective owners.
+## Docker access and security
 
-## Support and contributions
+The manager needs Docker API access to create and manage the separate game-server containers. This requires turning off Protection mode for the add-on. Docker API access can control containers on the Home Assistant host, so enable it only if you accept that access. See the [Home Assistant security guide](https://developers.home-assistant.io/docs/apps/guides/security/).
 
-Issues, suggestions, and contributions are welcome.
+## License and trademarks
 
-<p align="center">
-  <img src="https://raw.githubusercontent.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/main/assets/logo.png" width="200" alt="Home Assistant Game Servers">
-</p>
+See [LICENSE](LICENSE). This community project is not affiliated with Minecraft, Mojang, Microsoft, Modrinth, CurseForge, or Home Assistant. Their names and marks belong to their respective owners.

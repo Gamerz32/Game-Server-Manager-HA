@@ -72,3 +72,10 @@ Removing a server deletes its container and world directory after confirmation. 
 - [itzg RCON and console commands](https://docker-minecraft-server.readthedocs.io/en/latest/sending-commands/commands/)
 - [itzg RCON settings](https://docker-minecraft-server.readthedocs.io/en/latest/configuration/server-properties/)
 - [Home Assistant app security](https://developers.home-assistant.io/docs/apps/guides/security/)
+
+## Extending the manager with another game
+
+Server records now carry a separate game_id, and game integrations are registered under manager/games. The shared manager uses a driver contract for game-specific settings validation, container image and environment, data container naming, published ports or network adapter, console commands, player-count parsing, and feature capabilities. The game registry is exposed at /api/games for future UI selection.
+
+Minecraft is the only implemented and selectable driver today. Older records are treated as Minecraft, and its current Docker container names and gateway labels remain compatible with existing installs. A future game still needs its driver plus game-specific routes and UI; registering metadata alone does not enable an unsupported game.
+

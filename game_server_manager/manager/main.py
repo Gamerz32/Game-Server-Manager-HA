@@ -27,18 +27,23 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, PlainTextResponse
 from fastapi.staticfiles import StaticFiles
 
+from manager.games import get_game_driver, registered_games
+from manager.games.minecraft import MINECRAFT_DRIVER
+
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
-LOG = logging.getLogger("minecraft-manager")
+LOG = logging.getLogger("game-server-manager")
 DATA_DIR = Path("/data")
 SERVERS_DIR = DATA_DIR / "servers"
 SETTINGS_FILE = DATA_DIR / "manager-settings.json"
 OPTIONS_FILE = DATA_DIR / "options.json"
 STATIC_DIR = Path(__file__).parent / "static"
 DOCKER_SOCKET = "unix:///run/docker.sock"
-SERVER_IMAGE = "itzg/minecraft-server"
-MANAGER_LABEL = "io.gamerz32.minecraft-manager"
+MANAGER_LABEL = "io.gamerz32.game-server-manager"
+LEGACY_MINECRAFT_MANAGER_LABEL = "io.gamerz32.minecraft-manager"
 INGRESS_PEER = "172.30.32.2"
 MC_GAME_ID = 432
+JAVA_TAGS = MINECRAFT_DRIVER.java_tags
+SERVER_TYPES = set(MINECRAFT_DRIVER.server_types)
 CF_CLASS_IDS = {"modpack": 4471, "mod": 6, "plugin": 5}
 MODRINTH_BASE = "https://api.modrinth.com/v2"
 CURSEFORGE_BASE = "https://api.curseforge.com/v1"
@@ -47,8 +52,8 @@ UPDATE_CHECK_INTERVAL = 4 * 60 * 60
 MAINTENANCE_INTERVAL = 60
 UPDATE_DISCONNECT_REASON = "The Server is Updating, Please Wait"
 MINECRAFT_NETWORK_NAME = "ha-minecraft-manager"
-MINECRAFT_NETWORK_LABEL = f"{MANAGER_LABEL}.network"
-GATEWAY_LABEL = f"{MANAGER_LABEL}.gateway"
+MINECRAFT_NETWORK_LABEL = f"{LEGACY_MINECRAFT_MANAGER_LABEL}.network"
+GATEWAY_LABEL = f"{LEGACY_MINECRAFT_MANAGER_LABEL}.gateway"
 GATEWAY_CONTAINER_PREFIX = "ha-minecraft-gateway-"
 GATEWAY_INTERNAL_PORT = 18080
 GATEWAY_CONTAINER_PORT = 25565
@@ -71,7 +76,7 @@ MINECRAFT_VERSION_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None}
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
-POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="minecraft-job")
+POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="game-server-job")
 HOST_DATA_SOURCE: Path | None = None
 DOCKER_ERROR: str | None = None
 DOCKER_CLIENT: docker.DockerClient | None = None
@@ -114,7 +119,12 @@ def config_path(server_id: str) -> Path:
 def read_json(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
-        return value if isinstance(value, dict) else (fallback or {})
+        if not isinstance(value, dict):
+            return fallback or {}
+        # Older server records predate game_id; their first registered driver is Minecraft.
+        if path.name == "server.json" and value.get("id"):
+            value.setdefault("game_id", "minecraft")
+        return value
     except (OSError, json.JSONDecodeError):
         return fallback or {}
 
@@ -137,6 +147,35 @@ def settings() -> dict[str, Any]:
 
 def save_settings(value: dict[str, Any]) -> None:
     write_json(SETTINGS_FILE, value, secret=True)
+
+
+def game_driver_for(item: dict[str, Any]):
+    game_id = str(item.get("game_id") or "minecraft").strip().lower()
+    try:
+        return get_game_driver(game_id)
+    except KeyError as err:
+        raise RuntimeError(str(err)) from err
+
+
+def require_game_capability(item: dict[str, Any], capability: str, feature: str):
+    driver = game_driver_for(item)
+    if not getattr(driver.capabilities, capability, False):
+        raise HTTPException(status_code=409, detail=f"{feature} is not supported for {driver.display_name} servers.")
+    return driver
+
+
+def game_eula_accepted(game_id: str) -> bool:
+    current = settings()
+    accepted = current.get("game_eula_accepted")
+    if isinstance(accepted, dict) and accepted.get(game_id) is True:
+        return True
+    # Preserve existing installations that stored a single Minecraft EULA flag.
+    if game_id == "minecraft":
+        return current.get("eula_accepted") is True
+    try:
+        return not get_game_driver(game_id).requires_eula
+    except KeyError:
+        return False
 
 
 def all_configs() -> list[dict[str, Any]]:
@@ -260,6 +299,7 @@ def import_legacy_server() -> None:
         "port": 25565,
         "min_ram_mb": max(512, min(min_ram, 131072)),
         "max_ram_mb": max(512, min(max(max_ram, min_ram), 131072)),
+        "game_id": "minecraft",
         "java_version": "auto",
         "minecraft_version": version[:40],
         "created_at": __import__("datetime").datetime.now().isoformat(),
@@ -276,12 +316,20 @@ def import_legacy_server() -> None:
 
 
 def get_container(server_id: str):
-    container = docker_client().containers.get(f"ha-minecraft-{server_id}")
+    item = read_json(config_path(server_id))
+    if not item:
+        raise NotFound(f"Managed server {server_id} does not exist.")
+    driver = game_driver_for(item)
+    container = docker_client().containers.get(driver.container_name(server_id))
     container.reload()
     labels = container.attrs.get("Config", {}).get("Labels") or {}
-    if labels.get(MANAGER_LABEL) != "true" or labels.get(f"{MANAGER_LABEL}.server_id") != server_id:
+    generic_managed = labels.get(MANAGER_LABEL) == "true" and labels.get(f"{MANAGER_LABEL}.server_id") == server_id
+    legacy_label = driver.legacy_manager_label
+    legacy_managed = bool(legacy_label) and labels.get(legacy_label) == "true" and labels.get(f"{legacy_label}.server_id") == server_id
+    if not (generic_managed or legacy_managed):
         raise RuntimeError("The Docker container name is occupied by a container this app does not manage.")
-    ensure_server_network(container)
+    if driver.networking_adapter == "minecraft_gateway":
+        ensure_server_network(container)
     return container
 
 
@@ -302,8 +350,8 @@ def public_server(item: dict[str, Any]) -> dict[str, Any]:
         recent = [j for j in JOBS.values() if j.get("server_id") == item["id"]]
         if recent:
             job = max(recent, key=lambda j: j.get("created_at", ""))
-    port = item.get("port")
-    return {**item, "status": status, "job": job}
+    driver = game_driver_for(item)
+    return {**item, "game_id": driver.game_id, "game_name": driver.display_name, "status": status, "job": job}
 
 
 def safe_icon_url(value: Any) -> str:
@@ -318,11 +366,16 @@ def safe_icon_url(value: Any) -> str:
 
 
 def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dict[str, Any]:
+    game_id = str(data.get("game_id") or "minecraft").strip().lower()
+    try:
+        driver = get_game_driver(game_id)
+    except KeyError as err:
+        raise HTTPException(status_code=422, detail=f"Unsupported game: {game_id or 'unspecified'}.") from err
     name = str(data.get("name", "")).strip()
     if not name or len(name) > 60:
         raise HTTPException(status_code=422, detail="Enter a server name with 1 to 60 characters.")
     try:
-        port = int(data.get("port", 25565))
+        port = int(data.get("port", driver.default_port))
         min_ram = int(data.get("min_ram_mb", 1024))
         max_ram = int(data.get("max_ram_mb", 4096))
     except (ValueError, TypeError):
@@ -331,14 +384,6 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
         raise HTTPException(status_code=422, detail="Choose a TCP port between 1024 and 65535, excluding 8099 (the manager UI port).")
     if min_ram < 512 or max_ram < min_ram or max_ram > 131072:
         raise HTTPException(status_code=422, detail="RAM must be at least 512 MB, with maximum RAM greater than or equal to minimum RAM.")
-    java = str(data.get("java_version", "auto"))
-    if java not in JAVA_TAGS:
-        raise HTTPException(status_code=422, detail="Choose Java auto, 8, 17, 21, or 25.")
-    mc_version = str(data.get("minecraft_version", "LATEST")).strip() or "LATEST"
-    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", mc_version):
-        raise HTTPException(status_code=422, detail="Use a Minecraft version such as LATEST, 1.21.4, or SNAPSHOT.")
-    if mc_version.lower() == "latest":
-        mc_version = "LATEST"
     for item in all_configs():
         try:
             assigned_port = int(item.get("port", 0))
@@ -355,87 +400,35 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
             raise HTTPException(status_code=422, detail=f"{key.replace('_', ' ').title()} must be between {low} and {high}.")
         return value
 
+    try:
+        game_options = driver.validate_options(data)
+    except ValueError as err:
+        raise HTTPException(status_code=422, detail=str(err)) from err
+    capabilities = driver.capabilities
+    feature_flags = {
+        "auto_pause_enabled": "supports_auto_pause",
+        "auto_stop_enabled": "supports_auto_stop",
+        "auto_update_enabled": "supports_auto_update",
+        "wake_on_join": "supports_wake_on_join",
+    }
+    for flag, capability in feature_flags.items():
+        if data.get(flag) is True and not getattr(capabilities, capability):
+            raise HTTPException(status_code=422, detail=f"{driver.display_name} does not support {flag.replace('_enabled', '').replace('_', ' ')}.")
     return {
+        "game_id": driver.game_id,
         "name": name,
         "port": port,
         "min_ram_mb": min_ram,
         "max_ram_mb": max_ram,
-        "java_version": java,
-        "minecraft_version": mc_version,
-        "auto_pause_enabled": data.get("auto_pause_enabled", False) is True,
+        **game_options,
+        "auto_pause_enabled": data.get("auto_pause_enabled", False) is True and capabilities.supports_auto_pause,
         "auto_pause_minutes": bounded_int("auto_pause_minutes", 20, 5, 1440),
-        "auto_stop_enabled": data.get("auto_stop_enabled", False) is True,
+        "auto_stop_enabled": data.get("auto_stop_enabled", False) is True and capabilities.supports_auto_stop,
         "auto_stop_days": bounded_int("auto_stop_days", 3, 1, 365),
-        "auto_update_enabled": data.get("auto_update_enabled", False) is True,
+        "auto_update_enabled": data.get("auto_update_enabled", False) is True and capabilities.supports_auto_update,
         "auto_update_idle_hours": bounded_int("auto_update_idle_hours", 3, 1, 168),
-        "wake_on_join": data.get("wake_on_join", True) is not False,
+        "wake_on_join": data.get("wake_on_join", True) is not False and capabilities.supports_wake_on_join,
     }
-
-
-def env_for_server(item: dict[str, Any]) -> dict[str, str]:
-    env = {
-        "EULA": "TRUE",
-        "TYPE": "PAPER" if str(item.get("server_type", "")).upper() == "BUKKIT" else str(item.get("server_type", "VANILLA")),
-        "VERSION": str(item.get("minecraft_version", "LATEST")),
-        "INIT_MEMORY": f"{item.get('min_ram_mb', 1024)}M",
-        "MAX_MEMORY": f"{item.get('max_ram_mb', 4096)}M",
-        "MOTD": str(item.get("name", "Minecraft Server")),
-        "ONLINE_MODE": "TRUE",
-        "ENABLE_RCON": "true",
-        "RCON_PASSWORD": secrets.token_urlsafe(32),
-    }
-    pack = item.get("modpack") or {}
-    if item.get("server_type") == "MODRINTH" and pack:
-        env["MODRINTH_MODPACK"] = str(pack.get("project_id") or pack.get("slug"))
-        if pack.get("version_id"):
-            env["MODRINTH_VERSION"] = str(pack["version_id"])
-    elif item.get("server_type") == "AUTO_CURSEFORGE" and pack:
-        env["CF_SLUG"] = str(pack.get("slug") or pack.get("project_id"))
-        if pack.get("file_id"):
-            env["CF_FILE_ID"] = str(pack["file_id"])
-    modrinth_projects = []
-    for mod in item.get("mods", []):
-        if mod.get("platform") != "modrinth":
-            continue
-        project = str(mod.get("project_id", ""))
-        version_id = str(mod.get("version_id", ""))
-        loader_prefix = server_mod_loader(item).lower()
-        if loader_prefix in {"fabric", "forge", "neoforge", "quilt"}:
-            project = f"{loader_prefix}:{project}"
-        if version_id:
-            project = f"{project}:{version_id}"
-        if project:
-            modrinth_projects.append(project)
-    if str(item.get("server_type", "")).upper() in PLUGIN_SERVER_TYPES:
-        for plugin in item.get("plugins", []):
-            if plugin.get("platform") != "modrinth":
-                continue
-            project = str(plugin.get("project_id", ""))
-            version_id = str(plugin.get("version_id", ""))
-            if version_id:
-                project = f"{project}:{version_id}"
-            if project:
-                modrinth_projects.append(project)
-    curseforge_files = [
-        f"{entry.get('project_id')}:{entry.get('file_id')}"
-        for entry in item.get("mods", [])
-        if entry.get("platform") == "curseforge" and entry.get("project_id") and entry.get("file_id")
-    ]
-    if str(item.get("server_type", "")).upper() in PLUGIN_SERVER_TYPES:
-        curseforge_files.extend(
-            f"{entry.get('project_id')}:{entry.get('file_id')}"
-            for entry in item.get("plugins", [])
-            if entry.get("platform") == "curseforge" and entry.get("project_id") and entry.get("file_id")
-        )
-    if modrinth_projects:
-        env["MODRINTH_PROJECTS"] = "\n".join(modrinth_projects)
-    if curseforge_files:
-        env["CURSEFORGE_FILES"] = "\n".join(curseforge_files)
-    api_key = settings().get("curseforge_api_key", "").strip()
-    if api_key:
-        env["CF_API_KEY"] = api_key
-    return env
-
 
 def run_container(server_id: str) -> None:
     if SHUTTING_DOWN:
@@ -451,7 +444,8 @@ def run_container(server_id: str) -> None:
         existing.remove(force=True)
     except NotFound:
         pass
-    image = f"{SERVER_IMAGE}:{JAVA_TAGS.get(str(item.get('java_version', 'auto')), 'latest')}"
+    driver = game_driver_for(item)
+    image = driver.image_for(item)
     item["job_state"] = "pulling"
     write_json(config_path(server_id), item)
     try:
@@ -463,19 +457,31 @@ def run_container(server_id: str) -> None:
     item["job_state"] = "starting"
     write_json(config_path(server_id), item)
     data_source = host_server_data_dir(server_id)
-    labels = {MANAGER_LABEL: "true", f"{MANAGER_LABEL}.server_id": server_id}
-    env = env_for_server(item)
-    container = cli.containers.create(
-        image=image,
-        name=f"ha-minecraft-{server_id}",
-        labels=labels,
-        environment=env,
-        network=MINECRAFT_NETWORK_NAME,
-        volumes={str(data_source): {"bind": "/data", "mode": "rw"}},
-        restart_policy={"Name": "unless-stopped"},
-        tty=True,
-        stdin_open=True,
-    )
+    driver = game_driver_for(item)
+    labels = {
+        MANAGER_LABEL: "true",
+        f"{MANAGER_LABEL}.server_id": server_id,
+        f"{MANAGER_LABEL}.game_id": driver.game_id,
+    }
+    if driver.legacy_manager_label:
+        labels[driver.legacy_manager_label] = "true"
+        labels[f"{driver.legacy_manager_label}.server_id"] = server_id
+    create_options: dict[str, Any] = {
+        "image": image,
+        "name": driver.container_name(server_id),
+        "labels": labels,
+        "environment": driver.environment_for(item, settings()),
+        "volumes": {str(data_source): {"bind": "/data", "mode": "rw"}},
+        "restart_policy": {"Name": "unless-stopped"},
+        "tty": True,
+        "stdin_open": True,
+    }
+    if driver.container_network:
+        create_options["network"] = driver.container_network
+    port_bindings = driver.container_port_bindings(item)
+    if port_bindings:
+        create_options["ports"] = port_bindings
+    container = cli.containers.create(**create_options)
     try:
         container.start()
     except Exception:
@@ -928,7 +934,7 @@ def _ensure_gateway_container(server_id: str) -> None:
         current = client.containers.get(name)
         current.reload()
         labels = current.attrs.get("Config", {}).get("Labels") or {}
-        if labels.get(GATEWAY_LABEL) != "true" or labels.get(f"{MANAGER_LABEL}.server_id") != server_id:
+        if labels.get(GATEWAY_LABEL) != "true" or labels.get(f"{LEGACY_MINECRAFT_MANAGER_LABEL}.server_id") != server_id:
             raise OSError(f"Docker container name {name} is occupied by a container this app does not manage.")
         env = {}
         for value in current.attrs.get("Config", {}).get("Env") or []:
@@ -969,9 +975,9 @@ def _ensure_gateway_container(server_id: str) -> None:
             image=MANAGER_IMAGE,
             name=name,
             labels={
-                MANAGER_LABEL: "true",
+                LEGACY_MINECRAFT_MANAGER_LABEL: "true",
                 GATEWAY_LABEL: "true",
-                f"{MANAGER_LABEL}.server_id": server_id,
+                f"{LEGACY_MINECRAFT_MANAGER_LABEL}.server_id": server_id,
             },
             entrypoint=["python", "-m", "manager.gateway"],
             environment=expected_env,
@@ -1003,12 +1009,26 @@ async def ensure_gateway(server_id: str) -> None:
         raise OSError(f"Could not maintain gateway for server {server_id}: {err}") from err
 
 
+async def ensure_game_networking(server_id: str) -> None:
+    item = read_json(config_path(server_id))
+    if not item:
+        return
+    driver = game_driver_for(item)
+    if driver.networking_adapter == "minecraft_gateway":
+        await ensure_gateway(server_id)
+    elif driver.networking_adapter == "docker_ports":
+        return
+    else:
+        raise OSError(f"Game {driver.display_name} has an unknown networking adapter.")
+
+
+
 def cleanup_stale_gateways(valid_server_ids: set[str]) -> None:
     for container in docker_client().containers.list(all=True):
         labels = container.attrs.get("Config", {}).get("Labels") or {}
         if labels.get(GATEWAY_LABEL) != "true":
             continue
-        server_id = str(labels.get(f"{MANAGER_LABEL}.server_id", ""))
+        server_id = str(labels.get(f"{LEGACY_MINECRAFT_MANAGER_LABEL}.server_id", ""))
         if server_id not in valid_server_ids:
             try:
                 container.remove(force=True)
@@ -1023,7 +1043,7 @@ def _remove_gateway_container(server_id: str) -> None:
         container = docker_client().containers.get(name)
         container.reload()
         labels = container.attrs.get("Config", {}).get("Labels") or {}
-        if labels.get(GATEWAY_LABEL) != "true" or labels.get(f"{MANAGER_LABEL}.server_id") != server_id:
+        if labels.get(GATEWAY_LABEL) != "true" or labels.get(f"{LEGACY_MINECRAFT_MANAGER_LABEL}.server_id") != server_id:
             raise RuntimeError(f"Docker container name {name} is occupied by a container this app does not manage.")
         container.remove(force=True)
     except NotFound:
@@ -1034,22 +1054,37 @@ async def close_gateway(server_id: str) -> None:
     GATEWAYS.pop(server_id, None)
     await asyncio.to_thread(_remove_gateway_container, server_id)
 
+
+async def close_game_networking(server_id: str) -> None:
+    item = read_json(config_path(server_id))
+    if item and game_driver_for(item).networking_adapter == "minecraft_gateway":
+        await close_gateway(server_id)
+
 def rcon_output(server_id: str, command: str) -> str:
+    item = read_json(config_path(server_id))
+    if not item:
+        raise RuntimeError("Server configuration was not found.")
+    driver = game_driver_for(item)
+    if not driver.capabilities.supports_console:
+        raise RuntimeError(f"{driver.display_name} does not provide a console command channel.")
     container = get_container(server_id)
     if container.status != "running":
         raise RuntimeError("The server is not running.")
-    result = container.exec_run(["rcon-cli", command], stdout=True, stderr=True, demux=False)
-    output = result.output or b""
-    return output.decode("utf-8", errors="replace") if isinstance(output, bytes) else str(output)
+    return driver.send_console_command(container, command)
 
 
 def online_player_count(server_id: str) -> int | None:
+    item = read_json(config_path(server_id))
+    if not item:
+        return None
+    driver = game_driver_for(item)
+    if not driver.capabilities.supports_player_counts:
+        return None
     try:
         output = rcon_output(server_id, "list")
     except (DockerException, RuntimeError):
         return None
-    match = re.search(r"There are\s+(\d+)\s+of a max", output, re.IGNORECASE)
-    return int(match.group(1)) if match else None
+    return driver.parse_player_count(output)
 
 
 def _compatible_modrinth_version(version: dict[str, Any], game_version: str, loader: str) -> bool:
@@ -1112,11 +1147,20 @@ def provider_update(item: dict[str, Any], platform: str, project_id: str, curren
 
 
 def dockerhub_latest_digest(image: str) -> str | None:
-    tag = image.rsplit(":", 1)[-1]
+    reference = image.rsplit("@", 1)[0]
+    repository, separator, tag = reference.rpartition(":")
+    if not separator:
+        repository, tag = reference, "latest"
+    if repository.startswith("docker.io/"):
+        repository = repository[len("docker.io/"):]
+    if not repository or ("." in repository.split("/", 1)[0] and "/" in repository):
+        return None
+    if "/" not in repository:
+        repository = f"library/{repository}"
     try:
         auth = httpx.get(
             "https://auth.docker.io/token",
-            params={"service": "registry.docker.io", "scope": "repository:itzg/minecraft-server:pull"},
+            params={"service": "registry.docker.io", "scope": f"repository:{repository}:pull"},
             timeout=12,
         )
         auth.raise_for_status()
@@ -1124,7 +1168,7 @@ def dockerhub_latest_digest(image: str) -> str | None:
         if not token:
             return None
         response = httpx.head(
-            f"https://registry-1.docker.io/v2/itzg/minecraft-server/manifests/{tag}",
+            f"https://registry-1.docker.io/v2/{repository}/manifests/{tag}",
             headers={
                 "Authorization": f"Bearer {token}",
                 "Accept": "application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json",
@@ -1189,7 +1233,7 @@ def check_server_updates(server_id: str) -> None:
     except (httpx.HTTPError, ValueError, TypeError) as err:
         check_errors.append(f"Minecraft version check: {str(err)[:160]}")
         LOG.warning("Could not check Mojang version updates for server %s: %s", server_id, err)
-    image = f"{SERVER_IMAGE}:{JAVA_TAGS.get(str(item.get('java_version', 'auto')), 'latest')}"
+    image = game_driver_for(item).image_for(item)
     remote_digest = dockerhub_latest_digest(image)
     try:
         local = docker_client().images.get(image)
@@ -1238,7 +1282,7 @@ def apply_server_updates(server_id: str, force: bool = False) -> None:
                             project["file_id"] = update["file_id"]
         write_json(config_path(server_id), item)
         stop_container(server_id, remove=True, timeout=120)
-        image = f"{SERVER_IMAGE}:{JAVA_TAGS.get(str(item.get('java_version', 'auto')), 'latest')}"
+        image = game_driver_for(item).image_for(item)
         docker_client().images.pull(image)
         if was_running:
             run_container(server_id)
@@ -1330,13 +1374,13 @@ async def maintenance_loop() -> None:
             await asyncio.gather(*(asyncio.to_thread(maintain_server, server_id) for server_id in ids))
             for server_id in ids:
                 try:
-                    await ensure_gateway(server_id)
+                    await ensure_game_networking(server_id)
                 except OSError:
                     LOG.exception("Could not maintain gateway for server %s", server_id)
         except asyncio.CancelledError:
             raise
         except Exception:
-            LOG.exception("Minecraft maintenance cycle failed")
+            LOG.exception("Game-server maintenance cycle failed")
         await asyncio.sleep(MAINTENANCE_INTERVAL)
 
 
@@ -1644,14 +1688,14 @@ async def lifespan(app: FastAPI):
         cleanup_stale_gateways({str(item["id"]) for item in configs})
         for item in configs:
             try:
-                await ensure_gateway(item["id"])
+                await ensure_game_networking(item["id"])
             except OSError:
                 LOG.exception("Could not start Minecraft gateway for %s", item.get("name"))
             if item.get("desired_state") == "running":
                 submit_job(item["id"], "resume", lambda sid=item["id"]: ensure_running(sid))
     except Exception as err:
         DOCKER_ERROR = str(err)
-        LOG.error("Docker Engine is unavailable or the gateway network could not start: %s", err)
+        LOG.error("Docker Engine is unavailable or required game networking could not start: %s", err)
     MAINTENANCE_TASK = asyncio.create_task(maintenance_loop())
     yield
     SHUTTING_DOWN = True
@@ -1676,9 +1720,9 @@ async def lifespan(app: FastAPI):
                 try:
                     future.result(timeout=250)
                 except Exception:
-                    LOG.exception("A Minecraft server did not stop cleanly")
+                    LOG.exception("A game server did not stop cleanly")
     except Exception:
-        LOG.exception("Failed while stopping managed Minecraft servers")
+        LOG.exception("Failed while stopping managed game servers")
 
 
 app = FastAPI(title="Game Server Manager", lifespan=lifespan)
@@ -1725,7 +1769,8 @@ async def bootstrap():
     except Exception as err:
         error = str(err)
     return {
-        "eula_accepted": bool(settings().get("eula_accepted")),
+        "eula_accepted": game_eula_accepted("minecraft"),
+        "games": registered_games(),
         "curseforge_key_set": bool(settings().get("curseforge_api_key")),
         "docker_ready": api_ready,
         "docker_error": error,
@@ -1737,10 +1782,23 @@ async def bootstrap():
 
 @app.post("/api/setup")
 async def setup(payload: dict[str, Any]):
+    game_id = str(payload.get("game_id") or "minecraft").strip().lower()
+    try:
+        driver = get_game_driver(game_id)
+    except KeyError as err:
+        raise HTTPException(status_code=422, detail=f"Unsupported game: {game_id or 'unspecified'}.") from err
+    if not driver.requires_eula:
+        return {"ok": True}
     if payload.get("eula_accepted") is not True:
-        raise HTTPException(status_code=422, detail="Accept the Minecraft EULA before creating a server.")
+        raise HTTPException(status_code=422, detail=f"Accept the {driver.display_name} license before creating a server.")
     current = settings()
-    current["eula_accepted"] = True
+    acceptances = current.get("game_eula_accepted")
+    if not isinstance(acceptances, dict):
+        acceptances = {}
+    acceptances[driver.game_id] = True
+    current["game_eula_accepted"] = acceptances
+    if driver.game_id == "minecraft":
+        current["eula_accepted"] = True
     save_settings(current)
     return {"ok": True}
 
@@ -1760,6 +1818,11 @@ async def put_settings(payload: dict[str, Any]):
     return {"curseforge_key_set": bool(api_key)}
 
 
+@app.get("/api/games")
+async def games():
+    return registered_games()
+
+
 @app.get("/api/servers")
 async def servers():
     return [public_server(item) for item in all_configs()]
@@ -1767,12 +1830,17 @@ async def servers():
 
 @app.post("/api/servers")
 async def create_server(payload: dict[str, Any]):
-    if not settings().get("eula_accepted"):
-        raise HTTPException(status_code=409, detail="Complete the first-run EULA step before creating a server.")
-    clean = validate_config(payload)
+    game_id = str(payload.get("game_id") or "minecraft").strip().lower()
+    try:
+        driver = get_game_driver(game_id)
+    except KeyError as err:
+        raise HTTPException(status_code=422, detail=f"Unsupported game: {game_id or 'unspecified'}.") from err
+    if driver.requires_eula and not game_eula_accepted(driver.game_id):
+        raise HTTPException(status_code=409, detail=f"Complete the first-run {driver.display_name} license step before creating a server.")
+    clean = validate_config({**payload, "game_id": driver.game_id})
     kind = str(payload.get("server_type", "VANILLA")).upper()
-    if kind not in SERVER_TYPES:
-        raise HTTPException(status_code=422, detail="Choose a supported server type.")
+    if kind not in driver.server_types:
+        raise HTTPException(status_code=422, detail=f"Choose a supported {driver.display_name} server type.")
     pack_payload = payload.get("modpack")
     if kind in {"MODRINTH", "AUTO_CURSEFORGE"} and not isinstance(pack_payload, dict):
         raise HTTPException(status_code=422, detail="Choose a modpack in the Types tab.")
@@ -1808,7 +1876,7 @@ async def create_server(payload: dict[str, Any]):
         )
     item = {
         **clean, "id": server_id, "created_at": __import__("datetime").datetime.now().isoformat(),
-        "server_type": kind, "mod_loader": mod_loader,
+        "game_id": driver.game_id, "server_type": kind, "mod_loader": mod_loader,
         "modpack": modpack, "mods": [], "plugins": [], "desired_state": "running", "job_state": "queued",
         "last_player_seen": time.time(), "empty_since": None, "updates_available": [],
         "last_update_check": 0, "updating": False, "auto_paused": False, "auto_stopped": False,
@@ -1816,7 +1884,7 @@ async def create_server(payload: dict[str, Any]):
     server_dir(server_id).mkdir(parents=True, exist_ok=True)
     write_json(config_path(server_id), item)
     try:
-        await ensure_gateway(server_id)
+        await ensure_game_networking(server_id)
     except OSError as err:
         shutil.rmtree(server_dir(server_id), ignore_errors=True)
         raise HTTPException(status_code=409, detail=f"Could not listen on TCP port {clean['port']}: {err}")
@@ -1843,11 +1911,12 @@ async def update_server(server_id: str, payload: dict[str, Any]):
     merged = {**item, **payload}
     clean = validate_config(merged, existing_id=server_id)
     was_running = item.get("desired_state") == "running"
-    restart_required = any(item.get(key) != clean.get(key) for key in ("name", "min_ram_mb", "max_ram_mb", "java_version", "minecraft_version"))
+    driver = game_driver_for(item)
+    restart_required = any(item.get(key) != clean.get(key) for key in ("name", "min_ram_mb", "max_ram_mb", *driver.restart_keys))
     item.update(clean)
     write_json(config_path(server_id), item)
     try:
-        await ensure_gateway(server_id)
+        await ensure_game_networking(server_id)
     except OSError as err:
         write_json(config_path(server_id), original)
         raise HTTPException(status_code=409, detail=f"Could not listen on TCP port {clean['port']}: {err}")
@@ -1880,7 +1949,7 @@ async def start_server(server_id: str):
     item["auto_paused"] = False
     write_json(config_path(server_id), item)
     try:
-        await ensure_gateway(server_id)
+        await ensure_game_networking(server_id)
     except OSError as err:
         write_json(config_path(server_id), original)
         raise HTTPException(status_code=409, detail=f"Could not listen on TCP port {item['port']}: {err}")
@@ -1909,6 +1978,9 @@ async def update_server_now(server_id: str):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    driver = require_game_capability(item, "supports_auto_update", "Manual updates")
+    if driver.game_id != "minecraft":
+        raise HTTPException(status_code=409, detail=f"Manual updates are not implemented for {driver.display_name} yet.")
     if item.get("updating"):
         raise HTTPException(status_code=409, detail="This server is already updating.")
     item["updating"] = True
@@ -1923,6 +1995,11 @@ async def install_type(server_id: str, payload: dict[str, Any]):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    driver = game_driver_for(item)
+    if not driver.capabilities.supports_type_selection:
+        raise HTTPException(status_code=409, detail=f"{driver.display_name} does not provide a server type selector.")
+    if driver.game_id != "minecraft":
+        raise HTTPException(status_code=409, detail=f"Server type installation is not implemented for {driver.display_name} yet.")
     if item.get("updating"):
         raise HTTPException(status_code=409, detail="The server is updating.")
     kind = str(payload.get("kind", "")).upper()
@@ -1930,7 +2007,7 @@ async def install_type(server_id: str, payload: dict[str, Any]):
     requested_version = str(payload.get("minecraft_version", item.get("minecraft_version", "LATEST"))).strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", requested_version):
         raise HTTPException(status_code=422, detail="Choose a valid Minecraft release or snapshot version.")
-    if kind in {"VANILLA", "BUKKIT", "PAPER", "PURPUR", *MOD_LOADERS}:
+    if kind in driver.server_types and kind not in {"MODRINTH", "AUTO_CURSEFORGE"}:
         item.update({"server_type": kind, "minecraft_version": requested_version,
             "modpack": None, "mod_loader": kind if kind in MOD_LOADERS else "", "mods": []})
     elif provider in {"modrinth", "curseforge"} and kind == "MODPACK":
@@ -1977,6 +2054,9 @@ async def add_mod(server_id: str, payload: dict[str, Any]):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    driver = require_game_capability(item, "supports_mods", "Mods")
+    if driver.game_id != "minecraft":
+        raise HTTPException(status_code=409, detail=f"Mod installation is not implemented for {driver.display_name} yet.")
     if server_mod_loader(item) not in MOD_LOADERS:
         raise HTTPException(status_code=409, detail="Choose a compatible mod loader or modpack in the Types tab before adding mods.")
     if item.get("updating"):
@@ -2025,6 +2105,9 @@ async def remove_mod(server_id: str, platform: str, project_id: str):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    driver = require_game_capability(item, "supports_mods", "Mods")
+    if driver.game_id != "minecraft":
+        raise HTTPException(status_code=409, detail=f"Mod removal is not implemented for {driver.display_name} yet.")
     if item.get("updating"):
         raise HTTPException(status_code=409, detail="The server is updating.")
     item["mods"] = [m for m in item.get("mods", []) if not (m.get("platform") == platform.lower() and m.get("project_id") == project_id)]
@@ -2046,6 +2129,9 @@ async def add_plugin(server_id: str, payload: dict[str, Any]):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    driver = require_game_capability(item, "supports_plugins", "Plugins")
+    if driver.game_id != "minecraft":
+        raise HTTPException(status_code=409, detail=f"Plugin installation is not implemented for {driver.display_name} yet.")
     if str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
         raise HTTPException(status_code=409, detail="Choose Bukkit, Paper, or Purpur in the Types tab before adding plugins.")
     if item.get("updating"):
@@ -2094,6 +2180,9 @@ async def remove_plugin(server_id: str, platform: str, project_id: str):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    driver = require_game_capability(item, "supports_plugins", "Plugins")
+    if driver.game_id != "minecraft":
+        raise HTTPException(status_code=409, detail=f"Plugin removal is not implemented for {driver.display_name} yet.")
     if item.get("updating"):
         raise HTTPException(status_code=409, detail="The server is updating.")
     item["plugins"] = [plugin for plugin in item.get("plugins", []) if not (plugin.get("platform") == platform.lower() and plugin.get("project_id") == project_id)]
@@ -2120,7 +2209,7 @@ async def delete_server(server_id: str):
         raise HTTPException(status_code=409, detail="The server is updating.")
     item["deleting"] = True
     write_json(path / "server.json", item)
-    await close_gateway(server_id)
+    await close_game_networking(server_id)
 
     def remove_server():
         try:

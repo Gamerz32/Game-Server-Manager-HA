@@ -18,6 +18,7 @@ from contextlib import asynccontextmanager
 from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit
 
 import docker
 import httpx
@@ -303,6 +304,17 @@ def public_server(item: dict[str, Any]) -> dict[str, Any]:
             job = max(recent, key=lambda j: j.get("created_at", ""))
     port = item.get("port")
     return {**item, "status": status, "job": job}
+
+
+def safe_icon_url(value: Any) -> str:
+    candidate = str(value or "").strip()
+    if not candidate or len(candidate) > 2048:
+        return ""
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return ""
+    return candidate if parsed.scheme == "https" and parsed.netloc else ""
 
 
 def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dict[str, Any]:
@@ -1686,14 +1698,14 @@ async def create_server(payload: dict[str, Any]):
             version_id = str(pack_payload.get("version_id", ""))
             if not version_id:
                 raise HTTPException(status_code=422, detail="Select a Modrinth modpack version.")
-            modpack = {"platform": "modrinth", "project_id": project_id, "slug": slug, "title": str(pack_payload.get("title", "Modrinth pack"))[:120], "version_id": version_id}
+            modpack = {"platform": "modrinth", "project_id": project_id, "slug": slug, "title": str(pack_payload.get("title", "Modrinth pack"))[:120], "icon": safe_icon_url(pack_payload.get("icon")), "version_id": version_id}
         else:
             if not project_id.isdigit():
                 raise HTTPException(status_code=422, detail="CurseForge project ID must be numeric.")
             file_id = str(pack_payload.get("file_id", ""))
             if file_id and not file_id.isdigit():
                 raise HTTPException(status_code=422, detail="CurseForge file ID must be numeric.")
-            modpack = {"platform": "curseforge", "project_id": project_id, "slug": slug, "title": str(pack_payload.get("title", "CurseForge pack"))[:120], "file_id": file_id}
+            modpack = {"platform": "curseforge", "project_id": project_id, "slug": slug, "title": str(pack_payload.get("title", "CurseForge pack"))[:120], "icon": safe_icon_url(pack_payload.get("icon")), "file_id": file_id}
     server_id = str(uuid.uuid4())
     mod_loader = str(payload.get("mod_loader", "")).upper()
     if kind in MOD_LOADERS:
@@ -1849,14 +1861,14 @@ async def install_type(server_id: str, payload: dict[str, Any]):
             item.update({"server_type": "MODRINTH", "mod_loader": mod_loader, "mods": [],
                 "minecraft_version": requested_version,
                 "modpack": {"platform": "modrinth", "project_id": project_id, "slug": slug,
-                    "title": str(project.get("title", "Modrinth pack"))[:120], "version_id": version_id}})
+                    "title": str(project.get("title", "Modrinth pack"))[:120], "icon": safe_icon_url(project.get("icon")), "version_id": version_id}})
         else:
             if not project_id.isdigit():
                 raise HTTPException(status_code=422, detail="CurseForge project ID must be numeric.")
             item.update({"server_type": "AUTO_CURSEFORGE", "mod_loader": mod_loader, "mods": [],
                 "minecraft_version": requested_version,
                 "modpack": {"platform": "curseforge", "project_id": project_id, "slug": slug,
-                    "title": str(project.get("title", "CurseForge pack"))[:120], "file_id": file_id}})
+                    "title": str(project.get("title", "CurseForge pack"))[:120], "icon": safe_icon_url(project.get("icon")), "file_id": file_id}})
     else:
         raise HTTPException(status_code=422, detail="Choose a supported server type or modpack.")
     was_running = item.get("desired_state") == "running"

@@ -99,12 +99,12 @@
 
 .catalog-discovery{margin:16px 0 12px}
 .provider-switch{display:inline-flex;align-items:center;gap:5px;padding:4px;border:1px solid #35393c;border-radius:12px;background:#17191b}
-.provider-button{position:relative;display:inline-flex;align-items:center;gap:9px;min-height:42px;padding:5px 13px;border:1px solid transparent;border-radius:9px;background:transparent;color:#bac0c4;font:inherit;font-size:13px;font-weight:600;transition:background .16s,border-color .16s,color .16s}
+.provider-button{position:relative;display:inline-flex;width:44px;min-width:44px;min-height:42px;align-items:center;justify-content:center;gap:0;padding:5px;border:1px solid transparent;border-radius:9px;background:transparent;color:#bac0c4;font:inherit;transition:background .16s,border-color .16s,color .16s}
 .provider-button:hover{background:#242729;color:#f1f3f4}
 .provider-button.selected{border-color:#484d50;background:#242729;color:#f4f6f7}
-.provider-mark{position:relative;display:grid;width:29px;height:29px;place-items:center;flex:0 0 29px;border-radius:8px;font-size:13px;font-weight:800;letter-spacing:-.06em}
+.provider-mark{position:relative;display:grid;width:29px;height:29px;place-items:center;flex:0 0 29px;border-radius:8px}.provider-logo{display:block;width:18px;height:18px;object-fit:contain}
 .modrinth-mark{background:radial-gradient(circle at 48% 45%,#69ef9a44,transparent 74%),#183324;color:#7be5a2;box-shadow:0 0 15px #39d37952}
-.curseforge-mark{background:radial-gradient(circle at 48% 45%,#ff9f5c44,transparent 74%),#392416;color:#ffab67;box-shadow:0 0 15px #f1783152;font-size:9px;letter-spacing:-.05em}
+.curseforge-mark{background:radial-gradient(circle at 48% 45%,#ff9f5c44,transparent 74%),#392416;box-shadow:0 0 15px #f1783152}
 .provider-button.selected .modrinth-mark{box-shadow:0 0 21px #39d3798a}
 .provider-button.selected .curseforge-mark{box-shadow:0 0 21px #f178318a}
 .catalog-toolbar{align-items:center}
@@ -135,7 +135,7 @@
 .catalog-sort{flex:1;width:auto}
 .catalog-list-row{grid-template-columns:42px minmax(0,1fr);gap:10px}
 .catalog-list-meta{grid-column:2;align-items:flex-start;flex-direction:row;flex-wrap:wrap}
-.provider-button{padding:5px 8px;font-size:12px}
+.provider-button{width:42px;min-width:42px;min-height:40px;padding:4px}
 }
 
 .version-catalog .version-list-head,.version-catalog .version-row{grid-template-columns:minmax(92px,1.15fr) minmax(105px,1.2fr) minmax(48px,.5fr) minmax(82px,.9fr) minmax(78px,.85fr) 66px}
@@ -178,3 +178,36 @@
 .tab:disabled:hover,.tab.tab-disabled:hover{background:#1b1d1f;border-color:#3a3b3d;color:#777b7e}
 
 .check-row.check-disabled{opacity:.5;cursor:not-allowed}.check-row.check-disabled input{cursor:not-allowed}.form-help{grid-column:1/-1;margin-top:-8px;color:var(--muted);font-size:11px;line-height:1.5}
+
+.game-tabs{display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--line);margin:15px 0 10px}.game-tab{position:relative;border:0;background:transparent;color:#f1f4f5;padding:9px 13px;font-size:13px;font-weight:650}.game-tab::after{content:"";position:absolute;bottom:-1px;left:10px;right:10px;height:2px;border-radius:2px;background:var(--blue)}.game-tabs-note{margin-left:auto;color:var(--muted);font-size:11px;font-style:italic}@media(max-width:480px){.game-tabs{align-items:flex-start;flex-wrap:wrap}.game-tabs-note{margin-left:0;padding:0 12px 10px}}
+
+/* HA Plus Islands: Lovelace cards with contained, image-led accents. */
+.card-art>.status-pill{position:relative;z-index:1}
+.server-card{isolation:isolate;border-radius:14px;box-shadow:0 9px 30px #0005;transition:border-color .18s,box-shadow .18s}
+.server-card:hover{border-color:color-mix(in srgb,var(--server-accent,#79bce6) 48%,var(--line));box-shadow:0 10px 32px color-mix(in srgb,var(--server-accent,#79bce6) 18%,#0006)}
+.card-art{position:relative;isolation:isolate;overflow:hidden;border-radius:14px 14px 0 0;background:radial-gradient(circle at 13% 48%,color-mix(in srgb,var(--server-accent,#79bce6) 34%,transparent),transparent 39%),linear-gradient(130deg,color-mix(in srgb,var(--server-accent,#79bce6) 22%,#243746),#202326 72%)}
+.card-art:before{content:"";position:absolute;z-index:0;left:-24px;top:-56px;width:150px;height:150px;border-radius:50%;background:var(--server-accent,#79bce6);filter:blur(39px);opacity:.39;pointer-events:none}
+.card-logo{position:relative;z-index:1;filter:drop-shadow(0 4px 14px color-mix(in srgb,var(--server-accent,#79bce6) 78%,transparent))}
+.card-logo-wrap{position:relative;z-index:1;display:grid;width:48px;height:48px;place-items:center;flex:0 0 48px}
+.card-logo-glow{position:absolute;width:43px;height:43px;object-fit:cover;border-radius:50%;filter:blur(19px) saturate(1.9) brightness(1.3);opacity:.82;transform:scale(1.28);mix-blend-mode:screen}
+.card-logo-image{position:relative;z-index:1;width:43px;height:43px;object-fit:cover;border:1px solid color-mix(in srgb,var(--server-accent,#79bce6) 44%,var(--line));border-radius:10px;filter:drop-shadow(0 4px 10px #0008)}
+.card-actions{border-radius:0 0 14px 14px}
+.type-tile,.catalog-card{border-radius:14px}
+.type-tile{position:relative;isolation:isolate;box-shadow:0 6px 22px #0003}
+.type-tile:before{content:"";position:absolute;z-index:0;top:0;right:0;width:78%;height:68%;border-radius:50%;background:var(--tile-accent,#71b8e6);filter:blur(42px);opacity:.2;pointer-events:none}
+.type-tile .tile-art,.type-tile .tile-body{position:relative;z-index:1}
+.type-tile[data-kind="VANILLA"]{--tile-accent:#8abf73}
+.type-tile[data-kind="BUKKIT"],.type-tile[data-kind="PAPER"],.type-tile[data-kind="PURPUR"]{--tile-accent:#70b9e8}
+.type-tile[data-kind="FABRIC"],.type-tile[data-kind="QUILT"]{--tile-accent:#91c979}
+.type-tile[data-kind="FORGE"],.type-tile[data-kind="NEOFORGE"]{--tile-accent:#df9550}
+.type-tile .tile-art{background:radial-gradient(circle at center,color-mix(in srgb,var(--tile-accent,#71b8e6) 32%,transparent),transparent 57%),linear-gradient(145deg,#203749,#202326);color:var(--tile-accent,#9bceef);text-shadow:0 0 18px color-mix(in srgb,var(--tile-accent,#71b8e6) 62%,transparent)}
+.type-tile:hover,.type-tile:focus-visible{border-color:color-mix(in srgb,var(--tile-accent,#71b8e6) 62%,var(--line));box-shadow:0 8px 28px color-mix(in srgb,var(--tile-accent,#71b8e6) 22%,#0005);outline:none}
+.catalog-card[data-platform="modrinth"],.catalog-list-row[data-platform="modrinth"]{--catalog-accent:#1bd96a}
+.catalog-card[data-platform="curseforge"],.catalog-list-row[data-platform="curseforge"]{--catalog-accent:#f16436}
+.catalog-card:before{display:block;content:"";position:absolute;inset:0;z-index:0;pointer-events:none;border-radius:inherit;background:radial-gradient(circle at 13% 18%,color-mix(in srgb,var(--catalog-accent,#79bce6) 18%,transparent),transparent 47%);opacity:.72}
+.catalog-card:hover,.catalog-card:focus-visible{border-color:color-mix(in srgb,var(--catalog-accent,#79bce6) 66%,var(--line));box-shadow:0 10px 28px color-mix(in srgb,var(--catalog-accent,#79bce6) 20%,#0006);outline:none}
+.catalog-card .catalog-art-glow{opacity:.82}
+.catalog-card .catalog-art{border-radius:14px}
+.catalog-list-row{border-radius:12px;transition:background .15s,box-shadow .15s}
+.catalog-list-row:hover,.catalog-list-row:focus-visible{background:color-mix(in srgb,var(--catalog-accent,#79bce6) 8%,#222628);box-shadow:inset 0 0 0 1px color-mix(in srgb,var(--catalog-accent,#79bce6) 52%,transparent);outline:none}
+.catalog-list-row .catalog-list-art{box-shadow:0 0 20px color-mix(in srgb,var(--catalog-accent,#79bce6) 45%,transparent)}

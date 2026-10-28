@@ -1,5 +1,0 @@
-configuration:
-  host_networking:
-    name: Minecraft gateway host networking
-    description: >-
-      Enable host networking only for the Minecraft connection gateway containers. When disabled, Docker bridge networking publishes only each server's selected TCP port. The manager app remains on bridge networking in either mode. Restart this add-on after changing this option. Automatic updates are controlled separately in each server's settings and work in either mode.

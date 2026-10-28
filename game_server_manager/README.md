@@ -1,10 +1,10 @@
-# Minecraft Server Manager
+# Game Server Manager
 
-Manage multiple Minecraft Java servers from a Home Assistant ingress dashboard. Each server has its own <code>itzg/minecraft-server</code> container and persistent world directory.
+Manage multiple game servers from a Home Assistant ingress dashboard. Minecraft Java is the first supported game; each Minecraft server has its own <code>itzg/minecraft-server</code> container and persistent world directory. The manager is named and structured to grow to other game servers later, but those are not supported yet.
 
 ## Dashboard
 
-- Create as many server cards as the host can support.
+- Create as many Minecraft Java server cards as the host can support.
 - Each card shows a play or pause state control and a three-dot menu for Start/Stop, Terminal, and Settings.
 - Open the Types and Mods tabs to select Vanilla, server software, Modrinth modpacks, CurseForge modpacks, and compatible mods.
 - Use the built-in console to view live logs and send server commands through private RCON.
@@ -31,18 +31,18 @@ In the add-on's **Configuration** tab, **Minecraft gateway host networking** con
 
 Automatic update checks and scheduled updates work in either gateway network mode. Each server's **Auto-update** setting controls whether its releases and compatible content are checked every four hours and installed after the configured player-free interval. Catalog requests and downloads use the manager's bridge network. The gateway does not receive the Docker socket or server data mounts. Reserve TCP port 8099 for the manager web interface; it cannot be used as a Minecraft port. Router TCP port forwarding may be needed for players outside your home network.
 
-The dashboard itself is available through Home Assistant ingress. Start the app, open its page, choose **Show in sidebar**, and select **Minecraft Servers**.
+The dashboard itself is available through Home Assistant ingress. Start the app, open its page, choose **Show in sidebar**, and select **Game Servers**.
 
 ## Install and first run
 
 1. Add https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS to **Settings → Apps → App Store → Repositories**.
-2. Install **Minecraft Server Manager**.
+2. Install **Game Server Manager**.
 3. Turn off Protection mode and enable Docker API access for the app, then start it.
-4. Open **Minecraft Servers** from the sidebar or the app's **Open Web UI** button.
+4. Open **Game Servers** from the sidebar or the app's **Open Web UI** button.
 5. Accept the Minecraft EULA in the first-run dialog.
 6. Choose Vanilla, server software, or a Modrinth or CurseForge pack, then choose a Minecraft version, name, port, Java runtime, and RAM.
 
-The EULA is shown at [aka.ms/MinecraftEULA](https://aka.ms/MinecraftEULA). The manager will not create a server before it is accepted.
+Minecraft Java is the only currently supported game. The EULA is shown at [aka.ms/MinecraftEULA](https://aka.ms/MinecraftEULA), and the manager will not create a Minecraft server before it is accepted.
 
 ## Versions and catalogs
 

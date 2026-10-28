@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import html
+import hashlib
+import hmac
 import json
 import logging
 import os
@@ -29,6 +31,7 @@ LOG = logging.getLogger("minecraft-manager")
 DATA_DIR = Path("/data")
 SERVERS_DIR = DATA_DIR / "servers"
 SETTINGS_FILE = DATA_DIR / "manager-settings.json"
+OPTIONS_FILE = DATA_DIR / "options.json"
 STATIC_DIR = Path(__file__).parent / "static"
 DOCKER_SOCKET = "unix:///run/docker.sock"
 SERVER_IMAGE = "itzg/minecraft-server"
@@ -42,7 +45,20 @@ JAVA_TAGS = {"auto": "latest", "8": "java8", "17": "java17", "21": "java21", "25
 UPDATE_CHECK_INTERVAL = 4 * 60 * 60
 MAINTENANCE_INTERVAL = 60
 UPDATE_DISCONNECT_REASON = "The Server is Updating, Please Wait"
-GATEWAYS: dict[str, tuple[asyncio.AbstractServer, int]] = {}
+MINECRAFT_NETWORK_NAME = "ha-minecraft-manager"
+MINECRAFT_NETWORK_LABEL = f"{MANAGER_LABEL}.network"
+GATEWAY_LABEL = f"{MANAGER_LABEL}.gateway"
+GATEWAY_CONTAINER_PREFIX = "ha-minecraft-gateway-"
+GATEWAY_INTERNAL_PORT = 18080
+GATEWAY_CONTAINER_PORT = 25565
+GATEWAY_RELAY_MAGIC = b"MCG1"
+GATEWAY_RELAY_HEADER_SIZE = 4 + 36 + 64
+GATEWAYS: dict[str, dict[str, Any]] = {}
+HOST_NETWORKING_ENABLED = False
+MINECRAFT_NETWORK_IP = ""
+MANAGER_IMAGE = ""
+GATEWAY_SECRET = ""
+GATEWAY_RELAY_SERVER: asyncio.AbstractServer | None = None
 MAINTENANCE_TASK: asyncio.Task | None = None
 SERVER_TYPES = {"VANILLA", "BUKKIT", "PAPER", "PURPUR", "FABRIC", "FORGE", "NEOFORGE", "QUILT", "MODRINTH", "AUTO_CURSEFORGE"}
 MOD_LOADERS = {"FABRIC", "FORGE", "NEOFORGE", "QUILT"}
@@ -135,7 +151,7 @@ def all_configs() -> list[dict[str, Any]]:
     return sorted(results, key=lambda item: item.get("created_at", ""))
 
 
-def docker_self_data_source(client: docker.DockerClient) -> Path:
+def docker_self_container(client: docker.DockerClient):
     hostname = os.environ.get("HOSTNAME", "")
     own = None
     if hostname:
@@ -154,11 +170,56 @@ def docker_self_data_source(client: docker.DockerClient) -> Path:
                 break
     if own is None:
         raise RuntimeError("Could not identify this Home Assistant app container through the Docker API.")
+    return own
+
+
+def docker_self_data_source(client: docker.DockerClient) -> Path:
+    own = docker_self_container(client)
     for mount in own.attrs.get("Mounts", []):
         if mount.get("Destination") == "/data" and mount.get("Source"):
             return Path(mount["Source"])
     raise RuntimeError("Home Assistant's persistent /data mount was not found in the Docker container details.")
 
+
+def ensure_minecraft_network(client: docker.DockerClient):
+    global MINECRAFT_NETWORK_IP, MANAGER_IMAGE
+    try:
+        network = client.networks.get(MINECRAFT_NETWORK_NAME)
+    except NotFound:
+        network = client.networks.create(
+            MINECRAFT_NETWORK_NAME,
+            driver="bridge",
+            attachable=True,
+            labels={MINECRAFT_NETWORK_LABEL: "true"},
+        )
+    network.reload()
+    labels = network.attrs.get("Labels") or {}
+    if labels.get(MINECRAFT_NETWORK_LABEL) != "true":
+        raise RuntimeError(f"Docker network {MINECRAFT_NETWORK_NAME} exists but is not owned by this app.")
+    own = docker_self_container(client)
+    own.reload()
+    attached = own.attrs.get("NetworkSettings", {}).get("Networks", {})
+    if MINECRAFT_NETWORK_NAME not in attached:
+        network.connect(own, aliases=["ha-minecraft-manager"])
+        own.reload()
+    details = own.attrs.get("NetworkSettings", {}).get("Networks", {}).get(MINECRAFT_NETWORK_NAME, {})
+    MINECRAFT_NETWORK_IP = str(details.get("IPAddress") or "")
+    MANAGER_IMAGE = str(own.attrs.get("Config", {}).get("Image") or "")
+    if not MINECRAFT_NETWORK_IP or not MANAGER_IMAGE:
+        raise RuntimeError("Could not determine the app's address and image for the Minecraft gateway network.")
+    return network
+
+
+def ensure_server_network(container) -> None:
+    if not MINECRAFT_NETWORK_IP:
+        raise RuntimeError("The private Minecraft Docker network is not ready.")
+    container.reload()
+    networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
+    if MINECRAFT_NETWORK_NAME not in networks:
+        docker_client().networks.get(MINECRAFT_NETWORK_NAME).connect(container)
+        container.reload()
+    if MINECRAFT_NETWORK_NAME not in container.attrs.get("NetworkSettings", {}).get("Networks", {}):
+        raise RuntimeError("Could not attach the Minecraft server to the private app network.")
 
 def host_server_data_dir(server_id: str) -> Path:
     global HOST_DATA_SOURCE
@@ -219,6 +280,7 @@ def get_container(server_id: str):
     labels = container.attrs.get("Config", {}).get("Labels") or {}
     if labels.get(MANAGER_LABEL) != "true" or labels.get(f"{MANAGER_LABEL}.server_id") != server_id:
         raise RuntimeError("The Docker container name is occupied by a container this app does not manage.")
+    ensure_server_network(container)
     return container
 
 
@@ -396,7 +458,7 @@ def run_container(server_id: str) -> None:
         name=f"ha-minecraft-{server_id}",
         labels=labels,
         environment=env,
-        network_mode="bridge",
+        network=MINECRAFT_NETWORK_NAME,
         volumes={str(data_source): {"bind": "/data", "mode": "rw"}},
         restart_policy={"Name": "unless-stopped"},
         tty=True,
@@ -604,11 +666,8 @@ def backend_address(server_id: str) -> tuple[str, int] | None:
         if container.status != "running":
             return None
         networks = container.attrs.get("NetworkSettings", {}).get("Networks", {})
-        for details in networks.values():
-            address = details.get("IPAddress")
-            if address:
-                return str(address), 25565
-        address = container.attrs.get("NetworkSettings", {}).get("IPAddress")
+        details = networks.get(MINECRAFT_NETWORK_NAME, {})
+        address = details.get("IPAddress")
         return (str(address), 25565) if address else None
     except (DockerException, NotFound):
         return None
@@ -699,37 +758,202 @@ async def handle_minecraft_connection(server_id: str, reader: asyncio.StreamRead
         await close_writer(writer)
 
 
-async def ensure_gateway(server_id: str) -> None:
-    item = read_json(config_path(server_id))
-    if not item or item.get("deleting"):
-        return
-    port = int(item["port"])
-    current = GATEWAYS.get(server_id)
-    if current and current[1] == port and current[0].is_serving():
-        return
-    for other_id, (_, other_port) in GATEWAYS.items():
-        if other_id != server_id and other_port == port:
-            raise OSError(f"TCP port {port} is already managed by another server.")
-    server = await asyncio.start_server(
-        lambda reader, writer: handle_minecraft_connection(server_id, reader, writer),
-        host="0.0.0.0",
-        port=port,
+def gateway_token(server_id: str) -> str:
+    return hmac.new(GATEWAY_SECRET.encode("ascii"), server_id.encode("ascii"), hashlib.sha256).hexdigest()
+
+
+async def handle_gateway_relay(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        header = await asyncio.wait_for(reader.readexactly(GATEWAY_RELAY_HEADER_SIZE), timeout=5)
+        if header[:4] != GATEWAY_RELAY_MAGIC:
+            return
+        server_id = header[4:40].decode("ascii", errors="strict")
+        token = header[40:].decode("ascii", errors="strict")
+        try:
+            server_id = str(uuid.UUID(server_id))
+        except ValueError:
+            return
+        if not secrets.compare_digest(token, gateway_token(server_id)):
+            return
+        await handle_minecraft_connection(server_id, reader, writer)
+    except (asyncio.TimeoutError, asyncio.IncompleteReadError, ConnectionError, OSError, UnicodeDecodeError):
+        pass
+    except Exception:
+        LOG.exception("Minecraft gateway relay failed")
+    finally:
+        await close_writer(writer)
+
+
+async def start_gateway_relay() -> None:
+    global GATEWAY_RELAY_SERVER
+    if not MINECRAFT_NETWORK_IP:
+        raise RuntimeError("The private Minecraft Docker network is not ready.")
+    if GATEWAY_RELAY_SERVER:
+        GATEWAY_RELAY_SERVER.close()
+        await GATEWAY_RELAY_SERVER.wait_closed()
+    GATEWAY_RELAY_SERVER = await asyncio.start_server(
+        handle_gateway_relay,
+        host=MINECRAFT_NETWORK_IP,
+        port=GATEWAY_INTERNAL_PORT,
         reuse_address=True,
         backlog=128,
     )
-    old = GATEWAYS.get(server_id)
-    GATEWAYS[server_id] = (server, port)
-    if old:
-        old[0].close()
-        await old[0].wait_closed()
+
+
+async def stop_gateway_relay() -> None:
+    global GATEWAY_RELAY_SERVER
+    if GATEWAY_RELAY_SERVER:
+        GATEWAY_RELAY_SERVER.close()
+        await GATEWAY_RELAY_SERVER.wait_closed()
+        GATEWAY_RELAY_SERVER = None
+
+
+def _gateway_container_name(server_id: str) -> str:
+    return f"{GATEWAY_CONTAINER_PREFIX}{server_id}"
+
+
+def _start_gateway_container(container) -> None:
+    container.start()
+    deadline = time.monotonic() + 4
+    while time.monotonic() < deadline:
+        container.reload()
+        if container.status == "running":
+            return
+        if container.status in {"exited", "dead"}:
+            logs = container.logs(tail=30).decode("utf-8", errors="replace")
+            raise OSError(f"Gateway container exited while starting: {logs[-1200:]}")
+        time.sleep(0.1)
+    raise OSError("Gateway container did not become ready in time.")
+
+
+def _ensure_gateway_container(server_id: str) -> None:
+    item = read_json(config_path(server_id))
+    if not item or item.get("deleting"):
+        return
+    if not MINECRAFT_NETWORK_IP or not MANAGER_IMAGE or not GATEWAY_SECRET:
+        raise OSError("The private Minecraft gateway network is not ready.")
+    port = int(item["port"])
+    mode = "host" if HOST_NETWORKING_ENABLED else MINECRAFT_NETWORK_NAME
+    listen_port = port if HOST_NETWORKING_ENABLED else GATEWAY_CONTAINER_PORT
+    expected_env = {
+        "MCM_SERVER_ID": server_id,
+        "MCM_MANAGER_HOST": MINECRAFT_NETWORK_IP,
+        "MCM_MANAGER_PORT": str(GATEWAY_INTERNAL_PORT),
+        "MCM_GATEWAY_PORT": str(listen_port),
+        "MCM_GATEWAY_TOKEN": gateway_token(server_id),
+    }
+    client = docker_client()
+    name = _gateway_container_name(server_id)
+    current = None
+    try:
+        current = client.containers.get(name)
+        current.reload()
+        labels = current.attrs.get("Config", {}).get("Labels") or {}
+        if labels.get(GATEWAY_LABEL) != "true" or labels.get(f"{MANAGER_LABEL}.server_id") != server_id:
+            raise OSError(f"Docker container name {name} is occupied by a container this app does not manage.")
+        env = {}
+        for value in current.attrs.get("Config", {}).get("Env") or []:
+            if "=" in value:
+                key, val = value.split("=", 1)
+                env[key] = val
+        host_config = current.attrs.get("HostConfig", {})
+        current_mode = str(host_config.get("NetworkMode") or "")
+        current_networks = current.attrs.get("NetworkSettings", {}).get("Networks", {})
+        current_image = str(current.attrs.get("Config", {}).get("Image") or "")
+        current_port_bindings = host_config.get("PortBindings") or {}
+        bridge_port_matches = False
+        if not HOST_NETWORKING_ENABLED:
+            bindings = current_port_bindings.get(f"{GATEWAY_CONTAINER_PORT}/tcp") or []
+            bridge_port_matches = any(str(binding.get("HostPort")) == str(port) for binding in bindings)
+        network_matches = current_mode == "host" if HOST_NETWORKING_ENABLED else MINECRAFT_NETWORK_NAME in current_networks
+        matches = (
+            current.status == "running"
+            and network_matches
+            and current_image == MANAGER_IMAGE
+            and all(env.get(key) == value for key, value in expected_env.items())
+            and (HOST_NETWORKING_ENABLED or bridge_port_matches)
+        )
+        if matches:
+            GATEWAYS[server_id] = {"port": port, "mode": mode, "manager_host": MINECRAFT_NETWORK_IP}
+            return
+        current.remove(force=True)
+    except NotFound:
+        current = None
+    container = None
+    network_options = (
+        {"network_mode": "host"}
+        if HOST_NETWORKING_ENABLED
+        else {"network": MINECRAFT_NETWORK_NAME, "ports": {f"{GATEWAY_CONTAINER_PORT}/tcp": port}}
+    )
+    try:
+        container = client.containers.create(
+            image=MANAGER_IMAGE,
+            name=name,
+            labels={
+                MANAGER_LABEL: "true",
+                GATEWAY_LABEL: "true",
+                f"{MANAGER_LABEL}.server_id": server_id,
+            },
+            entrypoint=["python", "-m", "manager.gateway"],
+            environment=expected_env,
+            restart_policy={"Name": "unless-stopped"},
+            user="65534:65534",
+            read_only=True,
+            cap_drop=["ALL"],
+            security_opt=["no-new-privileges:true"],
+            tmpfs={"/tmp": "rw,noexec,nosuid,size=16m"},
+            **network_options,
+        )
+        _start_gateway_container(container)
+        GATEWAYS[server_id] = {"port": port, "mode": mode, "manager_host": MINECRAFT_NETWORK_IP}
+    except (DockerException, OSError) as err:
+        if container is not None:
+            try:
+                container.remove(force=True)
+            except DockerException:
+                pass
+        if isinstance(err, OSError):
+            raise
+        raise OSError(f"Could not start the Minecraft gateway on TCP port {port}: {err}") from err
+
+
+async def ensure_gateway(server_id: str) -> None:
+    try:
+        await asyncio.to_thread(_ensure_gateway_container, server_id)
+    except DockerException as err:
+        raise OSError(f"Could not maintain gateway for server {server_id}: {err}") from err
+
+
+def cleanup_stale_gateways(valid_server_ids: set[str]) -> None:
+    for container in docker_client().containers.list(all=True):
+        labels = container.attrs.get("Config", {}).get("Labels") or {}
+        if labels.get(GATEWAY_LABEL) != "true":
+            continue
+        server_id = str(labels.get(f"{MANAGER_LABEL}.server_id", ""))
+        if server_id not in valid_server_ids:
+            try:
+                container.remove(force=True)
+                LOG.info("Removed orphaned gateway container %s", container.name)
+            except (DockerException, NotFound):
+                LOG.exception("Could not remove orphaned gateway container %s", container.name)
+
+
+def _remove_gateway_container(server_id: str) -> None:
+    name = _gateway_container_name(server_id)
+    try:
+        container = docker_client().containers.get(name)
+        container.reload()
+        labels = container.attrs.get("Config", {}).get("Labels") or {}
+        if labels.get(GATEWAY_LABEL) != "true" or labels.get(f"{MANAGER_LABEL}.server_id") != server_id:
+            raise RuntimeError(f"Docker container name {name} is occupied by a container this app does not manage.")
+        container.remove(force=True)
+    except NotFound:
+        pass
 
 
 async def close_gateway(server_id: str) -> None:
-    current = GATEWAYS.pop(server_id, None)
-    if current:
-        current[0].close()
-        await current[0].wait_closed()
-
+    GATEWAYS.pop(server_id, None)
+    await asyncio.to_thread(_remove_gateway_container, server_id)
 
 def rcon_output(server_id: str, command: str) -> str:
     container = get_container(server_id)
@@ -996,13 +1220,13 @@ def maintain_server(server_id: str) -> None:
             verified_empty = True
         elif status in {"stopped", "exited"} and item.get("desired_state") == "stopped":
             verified_empty = True
-        if item.get("auto_update_enabled") and now - float(item.get("last_update_check") or 0) >= UPDATE_CHECK_INTERVAL:
+        if HOST_NETWORKING_ENABLED and item.get("auto_update_enabled") and now - float(item.get("last_update_check") or 0) >= UPDATE_CHECK_INTERVAL:
             write_json(config_path(server_id), item)
             check_server_updates(server_id)
             item = read_json(config_path(server_id))
         empty_since = float(item.get("empty_since") or item.get("last_player_seen") or now)
         idle_hours = (now - empty_since) / 3600
-        if verified_empty and item.get("auto_update_enabled") and item.get("updates_available") and idle_hours >= int(item.get("auto_update_idle_hours", 3)):
+        if HOST_NETWORKING_ENABLED and verified_empty and item.get("auto_update_enabled") and item.get("updates_available") and idle_hours >= int(item.get("auto_update_idle_hours", 3)):
             item["job_state"] = "update-queued"
             item["updating"] = True
             write_json(config_path(server_id), item)
@@ -1300,8 +1524,11 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global DOCKER_ERROR, HOST_DATA_SOURCE, SHUTTING_DOWN, MAINTENANCE_TASK
+    global HOST_NETWORKING_ENABLED, GATEWAY_SECRET
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SERVERS_DIR.mkdir(parents=True, exist_ok=True)
+    HOST_NETWORKING_ENABLED = bool(read_json(OPTIONS_FILE, {}).get("host_networking", False))
+    GATEWAY_SECRET = secrets.token_hex(32)
     try:
         import_legacy_server()
     except Exception:
@@ -1310,17 +1537,21 @@ async def lifespan(app: FastAPI):
         cli = docker_client()
         cli.ping()
         HOST_DATA_SOURCE = docker_self_data_source(cli)
+        ensure_minecraft_network(cli)
+        await start_gateway_relay()
         DOCKER_ERROR = None
-        for item in all_configs():
+        configs = all_configs()
+        cleanup_stale_gateways({str(item["id"]) for item in configs})
+        for item in configs:
             try:
                 await ensure_gateway(item["id"])
             except OSError:
-                LOG.exception("Could not bind Minecraft gateway for %s", item.get("name"))
+                LOG.exception("Could not start Minecraft gateway for %s", item.get("name"))
             if item.get("desired_state") == "running":
                 submit_job(item["id"], "resume", lambda sid=item["id"]: ensure_running(sid))
     except Exception as err:
         DOCKER_ERROR = str(err)
-        LOG.error("Docker Engine is unavailable: %s", err)
+        LOG.error("Docker Engine is unavailable or the gateway network could not start: %s", err)
     MAINTENANCE_TASK = asyncio.create_task(maintenance_loop())
     yield
     SHUTTING_DOWN = True
@@ -1331,7 +1562,11 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
     for server_id in list(GATEWAYS):
-        await close_gateway(server_id)
+        try:
+            await close_gateway(server_id)
+        except Exception:
+            LOG.exception("Could not stop gateway container for server %s", server_id)
+    await stop_gateway_relay()
     POOL.shutdown(wait=True, cancel_futures=True)
     try:
         ids = [x["id"] for x in all_configs()]
@@ -1385,6 +1620,7 @@ async def bootstrap():
         "curseforge_key_set": bool(settings().get("curseforge_api_key")),
         "docker_ready": api_ready,
         "docker_error": error,
+        "host_networking_enabled": HOST_NETWORKING_ENABLED,
         "servers": items,
         "first_run": not bool(settings().get("eula_accepted")) or len(items) == 0,
     }

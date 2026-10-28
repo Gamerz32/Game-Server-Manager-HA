@@ -176,3 +176,5 @@
 /* Keep every management tab visible; mark unavailable catalogs clearly. */
 .tab:disabled,.tab.tab-disabled{opacity:.42;cursor:not-allowed}
 .tab:disabled:hover,.tab.tab-disabled:hover{background:#1b1d1f;border-color:#3a3b3d;color:#777b7e}
+
+.check-row.check-disabled{opacity:.5;cursor:not-allowed}.check-row.check-disabled input{cursor:not-allowed}.form-help{grid-column:1/-1;margin-top:-8px;color:var(--muted);font-size:11px;line-height:1.5}

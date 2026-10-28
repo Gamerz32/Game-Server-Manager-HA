@@ -2,7 +2,7 @@ name: "Minecraft Server Manager"
 slug: minecraft_vanilla_server
 description: >
   Manage multiple Minecraft Java servers, Vanilla, modpacks, mods, and Bukkit-compatible plugins from a Home Assistant dashboard.
-version: "2.2.0"
+version: "2.3.0"
 url: https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server
 
 arch:
@@ -22,7 +22,12 @@ panel_icon: mdi:minecraft
 panel_admin: false
 
 docker_api: true
-host_network: true
+host_network: false
+
+options:
+  host_networking: false
+schema:
+  host_networking: bool
 
 map:
   - share:ro

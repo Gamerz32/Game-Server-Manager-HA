@@ -23,9 +23,13 @@ The player count and online console depend on RCON, which the manager enables pr
 
 ## Networking and Docker access
 
-The manager requires Docker API access to create and manage Minecraft containers. Turn off Protection mode and enable Docker API access in the app settings. Docker API access can control host containers, so Home Assistant assigns this app its lowest security rating.
+The manager requires Docker API access to create and manage Minecraft containers. Turn off Protection mode and enable Docker API access in the app settings. The Docker socket can control host containers, so this remains the add-on's highest security risk even with host networking disabled.
 
-The manager uses <code>host_network: true</code> so its lightweight TCP gateway can own each server's configured public port. Game containers stay on a private Docker bridge and do not publish their own ports. The gateway routes traffic to a running server, wakes a paused server on a login attempt, and returns an update disconnect while a server is updating. Reserve TCP port 8099 for the manager web interface; it cannot be used as a Minecraft port. Router TCP port forwarding may be needed for players outside your home network.
+The manager itself runs on Docker bridge networking. It creates a private bridge for the manager, Minecraft servers, and small TCP gateway containers. The gateways preserve pause wake-up and update refusal while publishing each server's selected TCP port.
+
+In the add-on's **Configuration** tab, **Minecraft gateway host networking** controls only those gateway containers. It is off by default. With it off, Docker bridge networking publishes only the assigned Minecraft port for each gateway. With it on, the gateway binds the assigned port in the host network namespace. Home Assistant restarts the add-on when the setting is changed; the restart stops managed servers cleanly and recreates their gateways in the selected mode. The manager's web interface and Minecraft server containers do not use host networking.
+
+Automatic update checks and scheduled updates are intentionally disabled while gateway host networking is off, as requested. Outbound catalog requests, downloads, and manual **Update now** actions still use the manager's bridge network. The gateway does not receive the Docker socket or server data mounts. Reserve TCP port 8099 for the manager web interface; it cannot be used as a Minecraft port. Router TCP port forwarding may be needed for players outside your home network.
 
 The dashboard itself is available through Home Assistant ingress. Start the app, open its page, choose **Show in sidebar**, and select **Minecraft Servers**.
 

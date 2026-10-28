@@ -494,17 +494,83 @@ def stop_container(server_id: str, remove: bool = False, timeout: int = 120) -> 
         container = get_container(server_id)
     except NotFound:
         return
-    try:
-        container.reload()
-        if container.status == "paused":
-            container.unpause()
+
+    # Docker can report "restarting" while a child container is in its restart
+    # backoff. Wait for it to reach a stoppable state instead of issuing a
+    # non-forced remove, which Docker rejects with HTTP 409.
+    deadline = time.monotonic() + max(timeout, 10) + 65
+    last_conflict = ""
+    while True:
+        try:
             container.reload()
-        if container.status == "running":
-            container.stop(timeout=timeout)
-        if remove:
-            container.remove()
-    except NotFound:
-        return
+        except NotFound:
+            return
+
+        status = container.status
+        if status == "paused":
+            try:
+                container.unpause()
+            except APIError as err:
+                if err.status_code not in {304, 409}:
+                    raise
+                last_conflict = str(err)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Timed out unpausing server container {server_id}: {last_conflict}") from err
+                time.sleep(0.25)
+            continue
+
+        if status == "running":
+            try:
+                container.stop(timeout=timeout)
+            except APIError as err:
+                if err.status_code not in {304, 409}:
+                    raise
+                last_conflict = str(err)
+                if time.monotonic() >= deadline:
+                    raise RuntimeError(f"Timed out stopping server container {server_id}: {last_conflict}") from err
+                time.sleep(0.25)
+            continue
+
+        if status == "restarting":
+            if time.monotonic() >= deadline:
+                detail = f": {last_conflict}" if last_conflict else ""
+                raise RuntimeError(f"Timed out waiting for server container {server_id} to leave Docker's restarting state{detail}")
+            time.sleep(0.25)
+            continue
+
+        if status in {"created", "exited", "dead"}:
+            if remove:
+                try:
+                    container.remove()
+                except NotFound:
+                    return
+                except APIError as err:
+                    if err.status_code != 409:
+                        raise
+                    last_conflict = str(err)
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"Timed out removing server container {server_id}: {last_conflict}") from err
+                    time.sleep(0.25)
+                    continue
+            elif status == "exited":
+                # If the server crashed before this stop request, disable its
+                # pending restart. ensure_running restores this policy on start.
+                try:
+                    container.update(restart_policy={"Name": "no"})
+                except APIError as err:
+                    if err.status_code not in {304, 409}:
+                        raise
+                    last_conflict = str(err)
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError(f"Timed out disabling restart for server container {server_id}: {last_conflict}") from err
+                    time.sleep(0.25)
+                    continue
+            return
+
+        if time.monotonic() >= deadline:
+            detail = f": {last_conflict}" if last_conflict else ""
+            raise RuntimeError(f"Timed out waiting for server container {server_id} to stop (Docker state: {status}){detail}")
+        time.sleep(0.25)
 
 
 def submit_job(server_id: str, operation: str, fn) -> str:
@@ -535,7 +601,7 @@ def submit_job(server_id: str, operation: str, fn) -> str:
 
 def ensure_running(server_id: str) -> None:
     status, container = current_status(server_id)
-    if status == "running":
+    if status in {"running", "restarting"}:
         return
     if container is not None and status == "paused":
         container.unpause()
@@ -546,6 +612,7 @@ def ensure_running(server_id: str) -> None:
         write_json(config_path(server_id), item)
         return
     if container is not None and status == "exited":
+        container.update(restart_policy={"Name": "unless-stopped"})
         container.start()
         item = read_json(config_path(server_id))
         item["desired_state"] = "running"

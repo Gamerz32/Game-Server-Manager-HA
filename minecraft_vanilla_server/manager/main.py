@@ -1220,13 +1220,13 @@ def maintain_server(server_id: str) -> None:
             verified_empty = True
         elif status in {"stopped", "exited"} and item.get("desired_state") == "stopped":
             verified_empty = True
-        if HOST_NETWORKING_ENABLED and item.get("auto_update_enabled") and now - float(item.get("last_update_check") or 0) >= UPDATE_CHECK_INTERVAL:
+        if item.get("auto_update_enabled") and now - float(item.get("last_update_check") or 0) >= UPDATE_CHECK_INTERVAL:
             write_json(config_path(server_id), item)
             check_server_updates(server_id)
             item = read_json(config_path(server_id))
         empty_since = float(item.get("empty_since") or item.get("last_player_seen") or now)
         idle_hours = (now - empty_since) / 3600
-        if HOST_NETWORKING_ENABLED and verified_empty and item.get("auto_update_enabled") and item.get("updates_available") and idle_hours >= int(item.get("auto_update_idle_hours", 3)):
+        if verified_empty and item.get("auto_update_enabled") and item.get("updates_available") and idle_hours >= int(item.get("auto_update_idle_hours", 3)):
             item["job_state"] = "update-queued"
             item["updating"] = True
             write_json(config_path(server_id), item)

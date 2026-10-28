@@ -1,9 +1,8 @@
-name: "Minecraft Java Server"
+name: "Minecraft Server Manager"
 slug: minecraft_vanilla_server
 description: >
-  A configurable Java server for Home Assistant with vanilla, popular server
-  software, and Modrinth or CurseForge modpack support.
-version: "1.0.0"
+  Manage multiple Minecraft Java servers, Vanilla, modpacks, and mods from a Home Assistant dashboard.
+version: "2.0.0"
 url: https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server
 
 arch:
@@ -14,55 +13,15 @@ startup: application
 boot: auto
 timeout: 300
 backup: cold
-breaking_versions:
-  - "1.0.0"
 
-ports:
-  "25565/tcp": 25565
-ports_description:
-  "25565/tcp": "Minecraft Java server (change the host port in the Network tab)"
+ingress: true
+ingress_port: 8099
+ingress_entry: /
+panel_title: Minecraft Servers
+panel_icon: mdi:minecraft
+panel_admin: false
+
+docker_api: true
 
 map:
-  - type: share
-    read_only: false
-
-options:
-  eula: false
-  server_type: VANILLA
-  mc_version: LATEST
-  java_version: auto
-  modpack: ""
-  xms_mb: 1024
-  xmx_mb: 4096
-  data_dir: "/share/minecraft-vanilla"
-  motd: "A Minecraft Server"
-  max_players: 20
-  difficulty: normal
-  game_mode: survival
-  online_mode: true
-  pvp: true
-  view_distance: 10
-  simulation_distance: 10
-  allow_flight: false
-  server_jar_url: ""
-
-schema:
-  eula: bool
-  server_type: list(VANILLA|PAPER|PURPUR|FABRIC|FORGE|NEOFORGE|QUILT|MODRINTH|AUTO_CURSEFORGE|CUSTOM)
-  mc_version: str(1,40)
-  java_version: list(auto|17|21|25)
-  modpack: str
-  curseforge_api_key: password?
-  xms_mb: int(512,131072)
-  xmx_mb: int(512,131072)
-  data_dir: str(1,255)
-  motd: str(1,120)
-  max_players: int(1,1000)
-  difficulty: list(peaceful|easy|normal|hard)
-  game_mode: list(survival|creative|adventure|spectator)
-  online_mode: bool
-  pvp: bool
-  view_distance: int(2,32)
-  simulation_distance: int(2,32)
-  allow_flight: bool
-  server_jar_url: str
+  - share:ro

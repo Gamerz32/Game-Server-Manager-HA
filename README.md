@@ -10,7 +10,7 @@ Each Minecraft server runs in its own [itzg/minecraft-server](https://docker-min
 - Start, stop, inspect logs, and send commands through each server's interactive console.
 - Configure memory, Java and Minecraft versions, and network ports per server.
 - Choose Vanilla, supported server software, or a Modrinth or CurseForge modpack and version.
-- Browse compatible mods and, where supported by the selected server software, plugins.
+- Use the Types, Mods, and Plugins tabs to browse compatible modpacks, mods, and plugins; catalogs that do not apply to the selected software are disabled.
 - Configure per-server automation for pausing or stopping idle servers, waking them on a connection attempt, and checking for updates.
 - Install updates manually, or enable each server's automatic update policy.
 - Open the manager through Home Assistant's sidebar using app ingress.
@@ -44,6 +44,10 @@ The Home Assistant app slug is `game_server_manager`. This is a new app identity
 ## Current scope
 
 Minecraft Java is the only supported game today. Other games are not installable through the manager yet. This repository contains only the Game Server Manager app.
+
+## AI-assisted development
+
+AI tools, including OpenAI Codex, have assisted with planning, interface design, implementation, documentation, and troubleshooting for this project. The project maintainer is responsible for reviewing and maintaining the work. AI-assisted changes can contain errors, so report issues and verify behavior in your own Home Assistant setup before relying on it.
 
 ## References
 

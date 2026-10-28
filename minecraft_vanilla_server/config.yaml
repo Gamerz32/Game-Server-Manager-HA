@@ -1,8 +1,8 @@
-name: "Minecraft Server Manager"
+name: "Game Server Manager"
 slug: minecraft_vanilla_server
 description: >
-  Manage multiple Minecraft Java servers, Vanilla, modpacks, mods, and Bukkit-compatible plugins from a Home Assistant dashboard.
-version: "2.3.5"
+  Manage multiple game servers from a Home Assistant dashboard. Minecraft Java is supported today, with room to add more games later.
+version: "2.4.0"
 url: https://github.com/Gamerz32/Home-Assistant-Gameservers-ADDONS/tree/main/minecraft_vanilla_server
 
 arch:
@@ -17,8 +17,8 @@ backup: cold
 ingress: true
 ingress_port: 8099
 ingress_entry: /
-panel_title: Minecraft Servers
-panel_icon: mdi:minecraft
+panel_title: Game Servers
+panel_icon: mdi:server-network
 panel_admin: false
 
 docker_api: true

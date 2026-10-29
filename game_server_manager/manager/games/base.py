@@ -9,6 +9,7 @@ class GameCapabilities:
     supports_modpacks: bool = False
     supports_mods: bool = False
     supports_plugins: bool = False
+    supports_addons: bool = False
     supports_type_selection: bool = False
     supports_console: bool = False
     supports_player_counts: bool = False

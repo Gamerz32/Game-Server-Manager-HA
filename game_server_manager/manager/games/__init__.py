@@ -4,11 +4,13 @@ from dataclasses import asdict
 from typing import Any
 
 from .base import GameDriver
+from .minecraft_bedrock import MINECRAFT_BEDROCK_DRIVER
 from .minecraft import MINECRAFT_DRIVER
 
 
 _DRIVERS: dict[str, GameDriver] = {
     MINECRAFT_DRIVER.game_id: MINECRAFT_DRIVER,
+    MINECRAFT_BEDROCK_DRIVER.game_id: MINECRAFT_BEDROCK_DRIVER,
 }
 
 

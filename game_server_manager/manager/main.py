@@ -1,24 +1,29 @@
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import html
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
 import re
 import secrets
 import shutil
+import stat
 import threading
 import time
 import uuid
+import zipfile
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager
 from html.parser import HTMLParser
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import urlsplit
+from urllib.parse import urljoin, urlsplit
 
 import docker
 import httpx
@@ -73,6 +78,10 @@ CF_LOADER_IDS = {"FORGE": 1, "FABRIC": 4, "QUILT": 5, "NEOFORGE": 6}
 CF_LOADER_NAMES = {value: key.lower() for key, value in CF_LOADER_IDS.items()}
 MINECRAFT_MANIFEST_URL = "https://piston-meta.mojang.com/mc/game/version_manifest_v2.json"
 MINECRAFT_VERSION_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None}
+BEDROCK_ADDON_MAX_BYTES = 32 * 1024 * 1024
+BEDROCK_ADDON_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
+BEDROCK_ADDON_MAX_FILES = 10000
+CURSEFORGE_BEDROCK_ADDON_CLASS: int | None = None
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -124,6 +133,28 @@ def read_json(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, A
         # Older server records predate game_id; their first registered driver is Minecraft.
         if path.name == "server.json" and value.get("id"):
             value.setdefault("game_id", "minecraft")
+            if value.get("game_id") == "minecraft":
+                value.setdefault("crossplay_enabled", False)
+                value.setdefault("crossplay_port", None)
+            value.setdefault("world_name", "Bedrock level" if value.get("game_id") == "minecraft_bedrock" else "world")
+            value.setdefault("world_seed", "")
+            value.setdefault("game_mode", "survival")
+            value.setdefault("difficulty", "easy")
+            value.setdefault("max_players", 10)
+            value.setdefault("pvp_enabled", True)
+            value.setdefault("allow_cheats", False)
+            value.setdefault("level_type", "DEFAULT")
+            value.setdefault("op_permission_level", 4)
+            value.setdefault("default_player_permission_level", "member")
+            value.setdefault("whitelist_enabled", False)
+            value.setdefault("whitelist_players", [])
+            value.setdefault("blacklist_enabled", False)
+            value.setdefault("blacklist_players", [])
+            value.setdefault("operators", [])
+            value.setdefault("members", [])
+            value.setdefault("visitors", [])
+            value.setdefault("bedrock_addons", [])
+            value.setdefault("access_lists_applied", {"whitelist_enabled": False, "whitelist_players": [], "blacklist_players": [], "operators": [], "members": [], "visitors": []})
         return value
     except (OSError, json.JSONDecodeError):
         return fallback or {}
@@ -155,6 +186,26 @@ def game_driver_for(item: dict[str, Any]):
         return get_game_driver(game_id)
     except KeyError as err:
         raise RuntimeError(str(err)) from err
+
+
+def host_ports_for(item: dict[str, Any], protocol: str) -> set[int]:
+    """Return host ports used by one managed server for TCP or UDP."""
+    driver = game_driver_for(item)
+    ports: set[int] = set()
+    if protocol == "tcp" and driver.networking_adapter == "minecraft_gateway":
+        ports.add(int(item.get("port", 0)))
+    for container_port, binding in (driver.container_port_bindings(item) or {}).items():
+        if not str(container_port).lower().endswith(f"/{protocol}"):
+            continue
+        values = binding if isinstance(binding, (list, tuple, set)) else [binding]
+        for value in values:
+            if isinstance(value, (list, tuple)):
+                value = value[-1]
+            try:
+                ports.add(int(value))
+            except (TypeError, ValueError):
+                continue
+    return {port for port in ports if 1 <= port <= 65535}
 
 
 def require_game_capability(item: dict[str, Any], capability: str, feature: str):
@@ -351,7 +402,483 @@ def public_server(item: dict[str, Any]) -> dict[str, Any]:
         if recent:
             job = max(recent, key=lambda j: j.get("created_at", ""))
     driver = game_driver_for(item)
-    return {**item, "game_id": driver.game_id, "game_name": driver.display_name, "status": status, "job": job}
+    icon_path = server_dir(item["id"]) / "data" / "gsm-server-icon.png"
+    return {**item, "game_id": driver.game_id, "game_name": driver.display_name, "server_icon": driver.game_id == "minecraft" and icon_path.is_file(), "status": status, "job": job}
+
+
+def normalized_player_list(data: dict[str, Any], key: str, game_id: str) -> list[str]:
+    raw = data.get(key, [])
+    if isinstance(raw, str):
+        values = raw.splitlines()
+    elif isinstance(raw, list) and all(isinstance(value, str) for value in raw):
+        values = raw
+    else:
+        raise HTTPException(status_code=422, detail=f"{key.replace('_', ' ').title()} must be a list of player names, one per line.")
+    if len(values) > 100:
+        raise HTTPException(status_code=422, detail=f"{key.replace('_', ' ').title()} can contain at most 100 players.")
+    normalized: list[str] = []
+    seen: set[str] = set()
+    for raw_value in values:
+        name = raw_value.strip()
+        if not name:
+            continue
+        if game_id == "minecraft":
+            valid = re.fullmatch(r"[A-Za-z0-9_]{1,16}|[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}", name)
+        else:
+            valid = re.fullmatch(r"[A-Za-z0-9_ .-]{1,32}(?::[0-9]{16,20})?", name)
+        if not valid:
+            edition = "Java player name or UUID" if game_id == "minecraft" else "Bedrock gamertag, XUID, or gamertag:XUID"
+            raise HTTPException(status_code=422, detail=f"Use a valid {edition} for {key.replace('_', ' ')}.")
+        folded = name.casefold()
+        if folded not in seen:
+            normalized.append(name)
+            seen.add(folded)
+    return normalized
+
+
+def validate_world_and_access_options(data: dict[str, Any], driver) -> dict[str, Any]:
+    game_id = driver.game_id
+    world_name = str(data.get("world_name", "Bedrock level" if game_id == "minecraft_bedrock" else "world")).strip()
+    if not world_name or len(world_name) > 64 or not re.fullmatch(r"[A-Za-z0-9 _.-]+", world_name) or world_name in {".", ".."} or world_name.endswith((".", " ")):
+        raise HTTPException(status_code=422, detail="Use a world name with up to 64 letters, numbers, spaces, dots, dashes, or underscores.")
+    world_seed = str(data.get("world_seed", "")).strip()
+    if len(world_seed) > 128 or any(ord(char) < 32 or ord(char) == 127 for char in world_seed):
+        raise HTTPException(status_code=422, detail="The world seed must be 128 characters or fewer and cannot contain control characters.")
+    game_mode = str(data.get("game_mode", "survival")).strip().lower()
+    valid_modes = {"survival", "creative", "adventure"} if game_id == "minecraft_bedrock" else {"survival", "creative", "adventure", "spectator"}
+    if game_mode not in valid_modes:
+        raise HTTPException(status_code=422, detail="Choose a game mode supported by this Minecraft edition.")
+    difficulty = str(data.get("difficulty", "easy")).strip().lower()
+    if difficulty not in {"peaceful", "easy", "normal", "hard"}:
+        raise HTTPException(status_code=422, detail="Choose peaceful, easy, normal, or hard difficulty.")
+    try:
+        max_players = int(data.get("max_players", 10))
+        op_permission_level = int(data.get("op_permission_level", 4))
+    except (TypeError, ValueError) as err:
+        raise HTTPException(status_code=422, detail="Player limit and operator permission level must be whole numbers.") from err
+    if max_players < 1 or max_players > 1000:
+        raise HTTPException(status_code=422, detail="Choose a player limit between 1 and 1000.")
+    if op_permission_level < 1 or op_permission_level > 4:
+        raise HTTPException(status_code=422, detail="Java operator permission level must be between 1 and 4.")
+    pvp_enabled = data.get("pvp_enabled", True)
+    allow_cheats = data.get("allow_cheats", False)
+    whitelist_enabled = data.get("whitelist_enabled", False)
+    blacklist_enabled = data.get("blacklist_enabled", False)
+    if any(not isinstance(value, bool) for value in (pvp_enabled, allow_cheats, whitelist_enabled, blacklist_enabled)):
+        raise HTTPException(status_code=422, detail="World and access-control toggles must be true or false.")
+    permission_level = str(data.get("default_player_permission_level", "member")).strip().lower()
+    if permission_level not in {"visitor", "member", "operator"}:
+        raise HTTPException(status_code=422, detail="Choose visitor, member, or operator as the default Bedrock permission level.")
+    level_type = str(data.get("level_type", "DEFAULT")).strip().upper()
+    if level_type not in {"DEFAULT", "FLAT", "LEGACY"}:
+        raise HTTPException(status_code=422, detail="Choose a Bedrock world type of Default, Flat, or Legacy.")
+    operators = normalized_player_list(data, "operators", game_id)
+    members = normalized_player_list(data, "members", game_id) if game_id == "minecraft_bedrock" else []
+    visitors = normalized_player_list(data, "visitors", game_id) if game_id == "minecraft_bedrock" else []
+    whitelist_players = normalized_player_list(data, "whitelist_players", game_id)
+    blacklist_players = normalized_player_list(data, "blacklist_players", game_id)
+    if game_id == "minecraft_bedrock" and (blacklist_enabled or blacklist_players):
+        raise HTTPException(status_code=422, detail="Vanilla Bedrock Dedicated Server has no native blacklist. Use the allow-list to control who can join.")
+    return {
+        "world_name": world_name,
+        "world_seed": world_seed,
+        "game_mode": game_mode,
+        "difficulty": difficulty,
+        "max_players": max_players,
+        "pvp_enabled": pvp_enabled,
+        "allow_cheats": allow_cheats if game_id == "minecraft_bedrock" else False,
+        "level_type": level_type if game_id == "minecraft_bedrock" else "DEFAULT",
+        "op_permission_level": op_permission_level,
+        "default_player_permission_level": permission_level if game_id == "minecraft_bedrock" else "member",
+        "whitelist_enabled": whitelist_enabled,
+        "whitelist_players": whitelist_players,
+        "blacklist_enabled": blacklist_enabled,
+        "blacklist_players": blacklist_players,
+        "operators": operators,
+        "members": members,
+        "visitors": visitors,
+    }
+
+
+def server_icon_path(server_id: str) -> Path:
+    return server_dir(server_id) / "data" / "gsm-server-icon.png"
+
+
+def decode_server_icon(encoded: Any) -> bytes:
+    if not isinstance(encoded, str) or len(encoded) > 350_000:
+        raise HTTPException(status_code=422, detail="Choose a PNG image smaller than 256 KB after resizing.")
+    try:
+        image = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as err:
+        raise HTTPException(status_code=422, detail="The server icon image data is invalid.") from err
+    if len(image) > 262_144 or len(image) < 24 or image[:8] != b"\x89PNG\r\n\x1a\n" or image[12:16] != b"IHDR":
+        raise HTTPException(status_code=422, detail="The server icon must be a valid 64×64 PNG image under 256 KB.")
+    width = int.from_bytes(image[16:20], "big")
+    height = int.from_bytes(image[20:24], "big")
+    if width != 64 or height != 64:
+        raise HTTPException(status_code=422, detail="The server icon must be resized to exactly 64×64 pixels.")
+    return image
+
+
+def parse_bedrock_addon_archive(filename: Any, encoded: Any) -> dict[str, Any]:
+    if not isinstance(filename, str) or not isinstance(encoded, str):
+        raise HTTPException(status_code=422, detail="Choose a .mcaddon or .mcpack file to upload.")
+    safe_filename = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    extension = Path(safe_filename).suffix.lower()
+    if extension not in {".mcaddon", ".mcpack"}:
+        raise HTTPException(status_code=422, detail="Bedrock add-ons must be uploaded as .mcaddon or .mcpack files.")
+    if not safe_filename or len(safe_filename) > 180 or any(ord(char) < 32 or ord(char) == 127 for char in safe_filename):
+        raise HTTPException(status_code=422, detail="The add-on filename is invalid.")
+    if len(encoded) > (BEDROCK_ADDON_MAX_BYTES * 4 // 3) + 8:
+        raise HTTPException(status_code=413, detail="Bedrock add-ons must be 32 MB or smaller.")
+    try:
+        archive = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as err:
+        raise HTTPException(status_code=422, detail="The add-on upload data is invalid.") from err
+    if not archive or len(archive) > BEDROCK_ADDON_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Bedrock add-ons must be 32 MB or smaller.")
+
+    try:
+        normalized_buffer = io.BytesIO()
+        total_size = 0
+        total_files = 0
+        normalized_names: set[str] = set()
+        embedded_index = 0
+        with zipfile.ZipFile(normalized_buffer, "w", compression=zipfile.ZIP_STORED) as normalized_bundle:
+            def expand_bundle(bundle_bytes: bytes, prefix: PurePosixPath, expand_embedded: bool) -> None:
+                nonlocal total_size, total_files, embedded_index
+                with zipfile.ZipFile(io.BytesIO(bundle_bytes)) as bundle:
+                    for info in bundle.infolist():
+                        name = info.filename
+                        if not name or "\\" in name or "\x00" in name or info.flag_bits & 0x1:
+                            raise HTTPException(status_code=422, detail="The add-on archive contains an unsafe or encrypted file entry.")
+                        path = PurePosixPath(name)
+                        if not path.parts or path.is_absolute() or any(part in {"..", ""} for part in path.parts) or (path.parts and ":" in path.parts[0]):
+                            raise HTTPException(status_code=422, detail="The add-on archive contains a path outside its package folder.")
+                        mode = (info.external_attr >> 16) & 0xFFFF
+                        file_type = stat.S_IFMT(mode)
+                        if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                            raise HTTPException(status_code=422, detail="The add-on archive contains a link or special file.")
+                        if info.is_dir():
+                            continue
+                        total_files += 1
+                        total_size += info.file_size
+                        if total_files > BEDROCK_ADDON_MAX_FILES:
+                            raise HTTPException(status_code=422, detail="The add-on archive has an unsupported number of files.")
+                        if total_size > BEDROCK_ADDON_MAX_EXPANDED_BYTES:
+                            raise HTTPException(status_code=413, detail="The expanded add-on archive must be 256 MB or smaller.")
+                        if expand_embedded and path.suffix.lower() == ".mcpack":
+                            embedded = bundle.read(info)
+                            nested_prefix = prefix / f"__gsm_embedded_pack_{embedded_index:04d}"
+                            embedded_index += 1
+                            expand_bundle(embedded, nested_prefix, False)
+                            continue
+                        output_path = prefix.joinpath(*path.parts)
+                        normalized = "/".join(output_path.parts)
+                        if normalized in normalized_names:
+                            raise HTTPException(status_code=422, detail="The add-on archive contains duplicate file paths.")
+                        normalized_names.add(normalized)
+                        normalized_bundle.writestr(normalized, bundle.read(info))
+
+            expand_bundle(archive, PurePosixPath(), extension == ".mcaddon")
+
+        normalized_buffer.seek(0)
+        with zipfile.ZipFile(normalized_buffer) as bundle:
+            manifests: list[dict[str, Any]] = []
+            for info in bundle.infolist():
+                path = PurePosixPath(info.filename)
+                if path.name != "manifest.json":
+                    continue
+                if info.file_size > 1024 * 1024:
+                    raise HTTPException(status_code=422, detail="An add-on manifest is too large to process.")
+                try:
+                    manifest = json.loads(bundle.read(info))
+                except (UnicodeDecodeError, json.JSONDecodeError, zipfile.BadZipFile) as err:
+                    raise HTTPException(status_code=422, detail="An add-on manifest is invalid JSON.") from err
+                header = manifest.get("header") if isinstance(manifest, dict) else None
+                modules = manifest.get("modules") if isinstance(manifest, dict) else None
+                if not isinstance(header, dict) or not isinstance(modules, list):
+                    continue
+                try:
+                    pack_id = str(uuid.UUID(str(header.get("uuid", ""))))
+                except (ValueError, AttributeError) as err:
+                    raise HTTPException(status_code=422, detail="An add-on manifest has an invalid pack UUID.") from err
+                raw_version = header.get("version")
+                if isinstance(raw_version, list) and len(raw_version) == 3 and all(isinstance(value, int) and not isinstance(value, bool) and value >= 0 for value in raw_version):
+                    version = raw_version
+                elif isinstance(raw_version, str) and re.fullmatch(r"\d+\.\d+\.\d+", raw_version):
+                    version = [int(part) for part in raw_version.split(".")]
+                else:
+                    raise HTTPException(status_code=422, detail="An add-on manifest must have a three-part version number.")
+                module_types = {str(module.get("type", "")).lower() for module in modules if isinstance(module, dict)}
+                if module_types & {"data", "script"}:
+                    kind = "behavior"
+                elif "resources" in module_types:
+                    kind = "resource"
+                else:
+                    continue
+                root = path.parent
+                root_name = "" if str(root) == "." else "/".join(root.parts)
+                display_name = str(header.get("name", "")).strip()[:120] or Path(safe_filename).stem[:120]
+                manifests.append({"uuid": pack_id, "kind": kind, "name": display_name, "version": version, "root": root_name})
+
+            if not manifests:
+                raise HTTPException(status_code=422, detail="The archive has no supported behavior-pack or resource-pack manifest.")
+            ids = [entry["uuid"] for entry in manifests]
+            roots = [entry["root"] for entry in manifests]
+            if len(ids) != len(set(ids)) or len(roots) != len(set(roots)):
+                raise HTTPException(status_code=422, detail="The archive contains duplicate add-on pack IDs or manifests.")
+            root_parts = [PurePosixPath(root).parts if root else () for root in roots]
+            for index, parts in enumerate(root_parts):
+                for other_index, other in enumerate(root_parts):
+                    if index != other_index and len(parts) < len(other) and other[:len(parts)] == parts:
+                        raise HTTPException(status_code=422, detail="The archive contains overlapping add-on package folders.")
+    except HTTPException:
+        raise
+    except (zipfile.BadZipFile, OSError, RuntimeError) as err:
+        raise HTTPException(status_code=422, detail="The add-on file is not a readable ZIP-based .mcaddon or .mcpack archive.") from err
+    return {"filename": safe_filename, "extension": extension, "archive": normalized_buffer.getvalue(), "packs": manifests}
+
+
+def bedrock_addon_pack_folder(data_root: Path, pack: dict[str, Any]) -> Path:
+    kind = str(pack.get("kind", ""))
+    if kind not in {"behavior", "resource"}:
+        raise RuntimeError("The saved add-on has an unsupported pack type.")
+    try:
+        pack_id = str(uuid.UUID(str(pack.get("uuid", ""))))
+    except (ValueError, AttributeError) as err:
+        raise RuntimeError("The saved add-on has an invalid pack UUID.") from err
+    parent = data_root / ("behavior_packs" if kind == "behavior" else "resource_packs")
+    if data_root not in parent.resolve().parents:
+        raise RuntimeError("The add-on pack folder is outside this server's data directory.")
+    return parent / pack_id
+
+
+def bedrock_world_pack_changes(data_root: Path, world_name: str, packs: list[dict[str, Any]], removing: bool = False) -> dict[Path, tuple[bytes | None, bytes]]:
+    world_dir = data_root / "worlds" / world_name
+    if data_root not in world_dir.resolve().parents:
+        raise RuntimeError("The configured world path is outside this server's data folder.")
+    changes: dict[Path, tuple[bytes | None, bytes]] = {}
+    for kind in sorted({str(pack.get("kind", "")) for pack in packs}):
+        if kind not in {"behavior", "resource"}:
+            raise RuntimeError("The saved add-on has an unsupported pack type.")
+        filename = "world_behavior_packs.json" if kind == "behavior" else "world_resource_packs.json"
+        path = world_dir / filename
+        if path.is_symlink():
+            raise RuntimeError(f"Refusing to modify a linked add-on manifest: {filename}.")
+        old = path.read_bytes() if path.is_file() else None
+        try:
+            entries = json.loads(old.decode("utf-8")) if old else []
+        except (UnicodeDecodeError, json.JSONDecodeError) as err:
+            raise RuntimeError(f"The existing {filename} is invalid JSON; repair it before changing add-ons.") from err
+        if not isinstance(entries, list) or any(not isinstance(entry, dict) for entry in entries):
+            raise RuntimeError(f"The existing {filename} must contain a JSON list of pack entries.")
+        ids = {str(pack.get("uuid", "")).lower() for pack in packs if pack.get("kind") == kind}
+        if removing:
+            updated = [entry for entry in entries if str(entry.get("pack_id", "")).lower() not in ids]
+        else:
+            if any(str(entry.get("pack_id", "")).lower() in ids for entry in entries):
+                raise RuntimeError("An add-on pack UUID is already enabled in this world.")
+            updated = [*entries, *({"pack_id": pack["uuid"], "version": pack["version"]} for pack in packs if pack.get("kind") == kind)]
+        content = (json.dumps(updated, indent=2, ensure_ascii=False) + "\n").encode("utf-8")
+        changes[path] = (old, content)
+    return changes
+
+
+def write_bedrock_world_pack_changes(changes: dict[Path, tuple[bytes | None, bytes]]) -> None:
+    written: list[Path] = []
+    try:
+        for path, (_, content) in changes.items():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = path.with_name(path.name + ".gsm-tmp")
+            temp_path.write_bytes(content)
+            temp_path.replace(path)
+            written.append(path)
+    except Exception:
+        for path in written:
+            original = changes[path][0]
+            try:
+                if original is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    temp_path = path.with_name(path.name + ".gsm-restore")
+                    temp_path.write_bytes(original)
+                    temp_path.replace(path)
+            except OSError:
+                LOG.exception("Could not restore Bedrock add-on manifest %s", path)
+        raise
+
+
+def restore_bedrock_world_pack_changes(changes: dict[Path, tuple[bytes | None, bytes]]) -> None:
+    for path, (original, _) in changes.items():
+        try:
+            if original is None:
+                path.unlink(missing_ok=True)
+            else:
+                temp_path = path.with_name(path.name + ".gsm-restore")
+                temp_path.write_bytes(original)
+                temp_path.replace(path)
+        except OSError:
+            LOG.exception("Could not restore Bedrock add-on manifest %s", path)
+
+
+def install_bedrock_addon_files(server_id: str, addon_id: str, addon: dict[str, Any]) -> None:
+    data_root = (server_dir(server_id) / "data").resolve()
+    data_root.mkdir(parents=True, exist_ok=True)
+    with zipfile.ZipFile(io.BytesIO(addon["archive"])) as bundle:
+        infos = bundle.infolist()
+        stage_root = data_root / ".gsm-addon-staging" / addon_id
+        staged: list[tuple[dict[str, Any], Path, Path]] = []
+        installed: list[Path] = []
+        changes: dict[Path, tuple[bytes | None, bytes]] = {}
+        manifests_written = False
+        try:
+            for pack in addon["packs"]:
+                destination = bedrock_addon_pack_folder(data_root, pack)
+                if destination.exists() or destination.is_symlink():
+                    raise RuntimeError(f"A {pack['kind']} pack with UUID {pack['uuid']} already exists on this server.")
+                stage = stage_root / f"{pack['kind']}-{pack['uuid']}"
+                stage.mkdir(parents=True, exist_ok=False)
+                root_parts = PurePosixPath(pack["root"]).parts if pack["root"] else ()
+                for info in infos:
+                    path = PurePosixPath(info.filename)
+                    if info.is_dir() or path.parts[:len(root_parts)] != root_parts:
+                        continue
+                    relative_parts = path.parts[len(root_parts):]
+                    if not relative_parts:
+                        continue
+                    output = stage.joinpath(*relative_parts)
+                    if stage.resolve() not in output.resolve().parents:
+                        raise RuntimeError("The add-on archive contains a path outside its package folder.")
+                    output.parent.mkdir(parents=True, exist_ok=True)
+                    with bundle.open(info) as source, output.open("xb") as target:
+                        shutil.copyfileobj(source, target)
+                staged.append((pack, stage, destination))
+            current = read_json(config_path(server_id))
+            changes = bedrock_world_pack_changes(data_root, str(current.get("world_name", "Bedrock level")), addon["packs"])
+            for pack, stage, destination in staged:
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                if data_root not in destination.parent.resolve().parents:
+                    raise RuntimeError("The add-on pack folder is outside this server's data directory.")
+                stage.replace(destination)
+                installed.append(destination)
+            write_bedrock_world_pack_changes(changes)
+            manifests_written = True
+            current["bedrock_addons"] = [*current.get("bedrock_addons", []), {
+                "id": addon_id,
+                "name": str(addon.get("display_name") or Path(addon["filename"]).stem)[:120],
+                "filename": addon["filename"],
+                "extension": addon["extension"],
+                "packs": [{"uuid": pack["uuid"], "kind": pack["kind"], "name": pack["name"], "version": pack["version"]} for pack in addon["packs"]],
+            }]
+            write_json(config_path(server_id), current)
+        except Exception:
+            if manifests_written:
+                restore_bedrock_world_pack_changes(changes)
+            for destination in installed:
+                shutil.rmtree(destination, ignore_errors=True)
+            raise
+        finally:
+            shutil.rmtree(stage_root, ignore_errors=True)
+
+
+def remove_bedrock_addon_files(server_id: str, addon_id: str) -> None:
+    item = read_json(config_path(server_id))
+    if not item:
+        raise RuntimeError("Server configuration was not found.")
+    addon = next((value for value in item.get("bedrock_addons", []) if value.get("id") == addon_id), None)
+    if not addon:
+        raise RuntimeError("The Bedrock add-on is no longer installed.")
+    packs = addon.get("packs", [])
+    data_root = (server_dir(server_id) / "data").resolve()
+    world_name = str(item.get("world_name", "Bedrock level"))
+    changes = bedrock_world_pack_changes(data_root, world_name, packs, removing=True)
+    trash_root = data_root / ".gsm-addon-removal" / addon_id
+    moved: list[tuple[Path, Path]] = []
+    manifests_written = False
+    removal_complete = False
+    try:
+        for pack in packs:
+            target = bedrock_addon_pack_folder(data_root, pack)
+            if target.is_symlink():
+                raise RuntimeError("Refusing to remove a linked Bedrock add-on pack folder.")
+            if data_root not in target.resolve().parents:
+                raise RuntimeError("The add-on pack folder is outside this server's data directory.")
+            if target.exists():
+                trash_root.mkdir(parents=True, exist_ok=True)
+                trash_target = trash_root / f"{pack['kind']}-{pack['uuid']}"
+                target.replace(trash_target)
+                moved.append((trash_target, target))
+        write_bedrock_world_pack_changes(changes)
+        manifests_written = True
+        item["bedrock_addons"] = [value for value in item.get("bedrock_addons", []) if value.get("id") != addon_id]
+        write_json(config_path(server_id), item)
+        removal_complete = True
+    except Exception:
+        if manifests_written:
+            restore_bedrock_world_pack_changes(changes)
+        for source, target in reversed(moved):
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                if source.exists():
+                    source.replace(target)
+            except OSError:
+                LOG.exception("Could not restore Bedrock add-on pack directory %s", target)
+        raise
+    finally:
+        if removal_complete:
+            shutil.rmtree(trash_root, ignore_errors=True)
+
+
+def queue_bedrock_addon_change(server_id: str, operation: str, change) -> tuple[str, dict[str, Any]]:
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    require_game_capability(item, "supports_addons", "Bedrock add-ons")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
+    keep_running = item.get("desired_state") == "running"
+    item["updating"] = True
+    item["job_state"] = "addon-queued"
+    write_json(config_path(server_id), item)
+
+    def apply_addon_change():
+        restart_attempted = False
+        try:
+            stop_container(server_id, remove=True, timeout=120)
+            change()
+            if keep_running:
+                restart_attempted = True
+                run_container(server_id)
+            latest = read_json(config_path(server_id))
+            if latest:
+                latest["updating"] = False
+                latest["job_state"] = "running" if keep_running else "stopped"
+                write_json(config_path(server_id), latest)
+        except Exception:
+            latest = read_json(config_path(server_id))
+            if keep_running and not restart_attempted:
+                try:
+                    run_container(server_id)
+                except Exception:
+                    LOG.exception("Could not restore Bedrock server %s after add-on change failed", server_id)
+            latest = read_json(config_path(server_id))
+            if latest:
+                latest["updating"] = False
+                latest["job_state"] = "addon-failed"
+                write_json(config_path(server_id), latest)
+            raise
+
+    try:
+        job_id = submit_job(server_id, operation, apply_addon_change)
+    except Exception:
+        item = read_json(config_path(server_id))
+        if item:
+            item["updating"] = False
+            item["job_state"] = "stopped" if item.get("desired_state") == "stopped" else "running"
+            write_json(config_path(server_id), item)
+        raise
+    return job_id, item
 
 
 def safe_icon_url(value: Any) -> str:
@@ -384,13 +911,6 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
         raise HTTPException(status_code=422, detail="Choose a TCP port between 1024 and 65535, excluding 8099 (the manager UI port).")
     if min_ram < 512 or max_ram < min_ram or max_ram > 131072:
         raise HTTPException(status_code=422, detail="RAM must be at least 512 MB, with maximum RAM greater than or equal to minimum RAM.")
-    for item in all_configs():
-        try:
-            assigned_port = int(item.get("port", 0))
-        except (ValueError, TypeError):
-            continue
-        if item.get("id") != existing_id and assigned_port == port:
-            raise HTTPException(status_code=409, detail=f"Port {port} is already assigned to {item.get('name', 'another server')}.")
     def bounded_int(key: str, default: int, low: int, high: int) -> int:
         try:
             value = int(data.get(key, default))
@@ -404,7 +924,29 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
         game_options = driver.validate_options(data)
     except ValueError as err:
         raise HTTPException(status_code=422, detail=str(err)) from err
+    world_and_access = validate_world_and_access_options(data, driver)
+    candidate = {
+        **data,
+        **game_options,
+        **world_and_access,
+        "game_id": driver.game_id,
+        "port": port,
+    }
+    candidate_tcp = host_ports_for(candidate, "tcp")
+    candidate_udp = host_ports_for(candidate, "udp")
+    for other in all_configs():
+        if other.get("id") == existing_id:
+            continue
+        tcp_conflicts = candidate_tcp & host_ports_for(other, "tcp")
+        if tcp_conflicts:
+            assigned = min(tcp_conflicts)
+            raise HTTPException(status_code=409, detail=f"TCP port {assigned} is already assigned to {other.get('name', 'another server')}.")
+        udp_conflicts = candidate_udp & host_ports_for(other, "udp")
+        if udp_conflicts:
+            assigned = min(udp_conflicts)
+            raise HTTPException(status_code=409, detail=f"UDP port {assigned} is already assigned to {other.get('name', 'another server')}.")
     capabilities = driver.capabilities
+    crossplay_enabled = game_options.get("crossplay_enabled") is True
     feature_flags = {
         "auto_pause_enabled": "supports_auto_pause",
         "auto_stop_enabled": "supports_auto_stop",
@@ -421,13 +963,14 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
         "min_ram_mb": min_ram,
         "max_ram_mb": max_ram,
         **game_options,
-        "auto_pause_enabled": data.get("auto_pause_enabled", False) is True and capabilities.supports_auto_pause,
+        **world_and_access,
+        "auto_pause_enabled": data.get("auto_pause_enabled", False) is True and capabilities.supports_auto_pause and not crossplay_enabled,
         "auto_pause_minutes": bounded_int("auto_pause_minutes", 20, 5, 1440),
-        "auto_stop_enabled": data.get("auto_stop_enabled", False) is True and capabilities.supports_auto_stop,
+        "auto_stop_enabled": data.get("auto_stop_enabled", False) is True and capabilities.supports_auto_stop and not crossplay_enabled,
         "auto_stop_days": bounded_int("auto_stop_days", 3, 1, 365),
         "auto_update_enabled": data.get("auto_update_enabled", False) is True and capabilities.supports_auto_update,
         "auto_update_idle_hours": bounded_int("auto_update_idle_hours", 3, 1, 168),
-        "wake_on_join": data.get("wake_on_join", True) is not False and capabilities.supports_wake_on_join,
+        "wake_on_join": data.get("wake_on_join", True) is not False and capabilities.supports_wake_on_join and not crossplay_enabled,
     }
 
 def run_container(server_id: str) -> None:
@@ -476,6 +1019,8 @@ def run_container(server_id: str) -> None:
         "tty": True,
         "stdin_open": True,
     }
+    if driver.game_id == "minecraft_bedrock":
+        create_options["mem_limit"] = int(item.get("max_ram_mb", 4096)) * 1024 * 1024
     if driver.container_network:
         create_options["network"] = driver.container_network
     port_bindings = driver.container_port_bindings(item)
@@ -493,6 +1038,7 @@ def run_container(server_id: str) -> None:
     item["job_state"] = "running"
     item["desired_state"] = "running"
     write_json(config_path(server_id), item)
+    threading.Thread(target=sync_server_access, args=(server_id,), name=f"access-sync-{server_id[:8]}", daemon=True).start()
 
 
 def stop_container(server_id: str, remove: bool = False, timeout: int = 120) -> None:
@@ -1073,6 +1619,118 @@ def rcon_output(server_id: str, command: str) -> str:
     return driver.send_console_command(container, command)
 
 
+def _command_player_name(name: str) -> str:
+    # validate_world_and_access_options permits only simple names, so quoting is
+    # sufficient for Bedrock gamertags containing spaces and cannot add commands.
+    return '"' + name + '"'
+
+
+def sync_server_access(server_id: str) -> None:
+    """Apply configured allow-list, ban-list, and Bedrock world-rule changes."""
+    try:
+        item = read_json(config_path(server_id))
+        if not item:
+            return
+        driver = game_driver_for(item)
+        deadline = time.monotonic() + 300
+        ready = False
+        while time.monotonic() < deadline:
+            status, container = current_status(server_id)
+            if status != "running" or container is None:
+                return
+            try:
+                if driver.game_id == "minecraft":
+                    output = driver.send_console_command(container, "list")
+                    ready = driver.parse_player_count(output) is not None
+                else:
+                    container.reload()
+                    health = container.attrs.get("State", {}).get("Health") or {}
+                    if health.get("Status"):
+                        ready = health.get("Status") == "healthy"
+                    else:
+                        output = driver.send_console_command(container, "list")
+                        ready = bool(output.strip())
+                if ready:
+                    break
+            except (DockerException, RuntimeError, OSError):
+                pass
+            time.sleep(3)
+        if not ready:
+            LOG.warning("Could not reach %s console to apply access settings for %s", driver.display_name, item.get("name"))
+            return
+
+        with server_lock(server_id):
+            item = read_json(config_path(server_id))
+            if not item or current_status(server_id)[0] != "running":
+                return
+            driver = game_driver_for(item)
+            previous = item.get("access_lists_applied") or {}
+            old_whitelist = set(previous.get("whitelist_players", []))
+            old_blacklist = set(previous.get("blacklist_players", []))
+            old_operators = set(previous.get("operators", []))
+            old_members = set(previous.get("members", []))
+            old_visitors = set(previous.get("visitors", []))
+            wanted_whitelist = set(item.get("whitelist_players", [])) if item.get("whitelist_enabled") else set()
+            wanted_blacklist = set(item.get("blacklist_players", [])) if item.get("blacklist_enabled") else set()
+            list_command = "allowlist" if driver.game_id == "minecraft_bedrock" else "whitelist"
+
+            commands: list[tuple[str, str, str]] = []
+            commands.extend(("operators", "deop", player) for player in sorted(old_operators - set(item.get("operators", []))))
+            commands.extend(("operators", "op", player) for player in sorted(set(item.get("operators", [])) - old_operators))
+            if driver.game_id == "minecraft_bedrock":
+                commands.extend(("members", "remove", player) for player in sorted(old_members - set(item.get("members", []))))
+                commands.extend(("members", "member", player) for player in sorted(set(item.get("members", [])) - old_members))
+                commands.extend(("visitors", "remove", player) for player in sorted(old_visitors - set(item.get("visitors", []))))
+                commands.extend(("visitors", "visitor", player) for player in sorted(set(item.get("visitors", [])) - old_visitors))
+            commands.extend(("whitelist_players", "remove", player) for player in sorted(old_whitelist - wanted_whitelist))
+            commands.extend(("whitelist_players", "add", player) for player in sorted(wanted_whitelist - old_whitelist))
+            if bool(previous.get("whitelist_enabled", False)) != bool(item.get("whitelist_enabled")):
+                commands.append(("whitelist_enabled", "on" if item.get("whitelist_enabled") else "off", ""))
+            commands.extend(("blacklist_players", "pardon", player) for player in sorted(old_blacklist - wanted_blacklist))
+            commands.extend(("blacklist_players", "ban", player) for player in sorted(wanted_blacklist - old_blacklist))
+            for key, action, player in commands:
+                if key == "whitelist_enabled":
+                    command = f"{list_command} {action}"
+                elif key == "whitelist_players":
+                    command = f"{list_command} {action} {_command_player_name(player)}"
+                elif key in {"operators", "blacklist_players"}:
+                    command = f"{action} {_command_player_name(player)}"
+                else:
+                    permission = str(item.get("default_player_permission_level", "member")) if action == "remove" else action
+                    command = f"permission set {_command_player_name(player)} {permission}"
+                driver.send_console_command(get_container(server_id), command)
+                if key == "whitelist_enabled":
+                    previous["whitelist_enabled"] = action == "on"
+                elif key == "whitelist_players":
+                    current = set(previous.get("whitelist_players", []))
+                    current.discard(player) if action == "remove" else current.add(player)
+                    previous["whitelist_players"] = sorted(current)
+                elif key == "blacklist_players":
+                    current = set(previous.get("blacklist_players", []))
+                    current.discard(player) if action == "pardon" else current.add(player)
+                    previous["blacklist_players"] = sorted(current)
+                elif key in {"members", "visitors"}:
+                    current = set(previous.get(key, []))
+                    current.discard(player) if action == "remove" else current.add(player)
+                    previous[key] = sorted(current)
+                else:
+                    current = set(previous.get(key, []))
+                    current.discard(player) if action == "deop" else current.add(player)
+                    previous[key] = sorted(current)
+                item["access_lists_applied"] = previous
+                write_json(config_path(server_id), item)
+
+            if driver.game_id == "minecraft_bedrock":
+                applied_world = item.get("world_settings_applied") or {}
+                wanted_pvp = bool(item.get("pvp_enabled", True))
+                if applied_world.get("pvp_enabled") != wanted_pvp:
+                    driver.send_console_command(get_container(server_id), f"gamerule pvp {str(wanted_pvp).lower()}")
+                    item["world_settings_applied"] = {"pvp_enabled": wanted_pvp}
+                    write_json(config_path(server_id), item)
+    except Exception:
+        LOG.exception("Could not apply access settings for server %s", server_id)
+
+
 def online_player_count(server_id: str) -> int | None:
     item = read_json(config_path(server_id))
     if not item:
@@ -1441,6 +2099,22 @@ async def minecraft_manifest() -> dict[str, Any]:
     return payload
 
 
+async def require_release_for_plugin_server(server_type: str, version: str) -> None:
+    if str(server_type).upper() not in PLUGIN_SERVER_TYPES:
+        return
+    selected = str(version).strip()
+    snapshot_label = re.search(r"(?i)(?:^\d{2}w\d{2}[a-z](?:_or_[a-z])?$|(?:^|[-_.])(?:snapshot|pre|rc)(?:[-_.]?\d+|$))", selected)
+    if selected.upper() == "SNAPSHOT" or snapshot_label:
+        raise HTTPException(status_code=422, detail="Bukkit, Paper, and Purpur servers require a Minecraft release; snapshots are not supported.")
+    try:
+        manifest = await minecraft_manifest()
+    except (httpx.HTTPError, HTTPException):
+        return
+    selected_version = next((entry for entry in manifest.get("versions", []) if entry.get("id") == selected), None)
+    if selected_version and selected_version.get("type") == "snapshot":
+        raise HTTPException(status_code=422, detail="Bukkit, Paper, and Purpur servers require a Minecraft release; snapshots are not supported.")
+
+
 async def resolve_minecraft_version(item: dict[str, Any]) -> str:
     version = str(item.get("minecraft_version", "")).strip()
     if version.upper() not in {"", "LATEST", "SNAPSHOT"}:
@@ -1621,6 +2295,30 @@ async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: i
     return {"hits": hits, "total_hits": data.get("total_hits", 0)}
 
 
+async def curseforge_bedrock_addon_class_id() -> int:
+    global CURSEFORGE_BEDROCK_ADDON_CLASS
+    if CURSEFORGE_BEDROCK_ADDON_CLASS is not None:
+        return CURSEFORGE_BEDROCK_ADDON_CLASS
+    key = settings().get("curseforge_api_key", "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
+    async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
+        response = await client.get(f"{CURSEFORGE_BASE}/categories", params={"gameId": MC_GAME_ID, "classesOnly": "true"})
+        response.raise_for_status()
+        categories = response.json().get("data", [])
+    for category in categories:
+        if not isinstance(category, dict):
+            continue
+        names = {re.sub(r"[^a-z0-9]", "", str(category.get(field, "")).lower()) for field in ("slug", "name")}
+        if names & {"addon", "addons", "bedrockaddon", "bedrockaddons"}:
+            try:
+                CURSEFORGE_BEDROCK_ADDON_CLASS = int(category.get("id", category.get("classId")))
+            except (TypeError, ValueError):
+                continue
+            return CURSEFORGE_BEDROCK_ADDON_CLASS
+    raise HTTPException(status_code=502, detail="CurseForge did not return the Minecraft Bedrock Add-ons category. Check the API key and try again.")
+
+
 async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset: int, sort: str) -> dict[str, Any]:
     key = settings().get("curseforge_api_key", "").strip()
     if not key:
@@ -1663,6 +2361,106 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
             "icon": (project.get("logo") or {}).get("url", ""), "downloads": project.get("downloadCount", 0),
             "platform": "curseforge", "url": (project.get("links") or {}).get("websiteUrl", ""), "compatible": compatible})
     return {"hits": hits, "total_hits": data.get("pagination", {}).get("totalCount", 0)}
+
+
+async def curseforge_bedrock_addon_search(query: str, offset: int, sort: str) -> dict[str, Any]:
+    key = settings().get("curseforge_api_key", "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
+    class_id = await curseforge_bedrock_addon_class_id()
+    params = {"gameId": MC_GAME_ID, "classId": class_id, "searchFilter": query, "index": offset,
+        "pageSize": 24, "sortField": 6 if sort == "downloads" else 3, "sortOrder": "desc"}
+    async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
+        response = await client.get(f"{CURSEFORGE_BASE}/mods/search", params=params)
+        response.raise_for_status()
+        data = response.json()
+    hits = []
+    for project in data.get("data", []):
+        hits.append({"project_id": str(project["id"]), "slug": project.get("slug", str(project["id"])),
+            "title": project.get("name", "CurseForge add-on"), "description": project.get("summary", ""),
+            "icon": (project.get("logo") or {}).get("url", ""), "downloads": project.get("downloadCount", 0),
+            "platform": "curseforge", "url": (project.get("links") or {}).get("websiteUrl", "")})
+    return {"hits": hits, "total_hits": data.get("pagination", {}).get("totalCount", 0)}
+
+
+async def curseforge_bedrock_addon_detail(project_id: str, offset: int) -> dict[str, Any]:
+    key = settings().get("curseforge_api_key", "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
+    class_id = await curseforge_bedrock_addon_class_id()
+    headers = {"x-api-key": key, "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+        project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
+        project_response.raise_for_status()
+        project = project_response.json().get("data", {})
+        try:
+            project_class_id = int(project.get("classId", 0))
+        except (TypeError, ValueError):
+            project_class_id = 0
+        if project_class_id != class_id:
+            raise HTTPException(status_code=422, detail="This CurseForge project is not a Minecraft Bedrock add-on.")
+        desc_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/description")
+        desc_response.raise_for_status()
+        description = clean_description(desc_response.json().get("data", ""))
+        files_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/files", params={"pageSize": 50, "index": offset})
+        files_response.raise_for_status()
+        files_payload = files_response.json()
+    files = files_payload.get("data", [])
+    versions = []
+    for file in files:
+        filename = str(file.get("fileName", ""))
+        if not filename.lower().endswith((".mcaddon", ".mcpack")) or file.get("isAvailable") is False:
+            continue
+        versions.append({"id": str(file.get("id", "")), "number": str(file.get("displayName") or filename),
+            "name": filename, "game_versions": curseforge_game_versions(file.get("gameVersions", [])), "loaders": [],
+            "targets": [], "compatible": True, "version_type": "", "date_published": str(file.get("fileDate", "")),
+            "downloads": int(file.get("downloadCount", 0)), "size": int(file.get("fileLength", 0))})
+    total = int(files_payload.get("pagination", {}).get("totalCount", len(files)))
+    next_offset = offset + len(files)
+    return {"project_id": str(project.get("id", project_id)), "slug": project.get("slug", str(project_id)),
+        "title": project.get("name", ""), "description": description or project.get("summary", ""),
+        "icon": (project.get("logo") or {}).get("url", ""), "platform": "curseforge", "versions": versions,
+        "version_offset": offset, "next_offset": next_offset, "total_versions": total, "has_more": next_offset < total,
+        "website_url": (project.get("links") or {}).get("websiteUrl", "")}
+
+
+def validate_curseforge_download_url(url: str) -> None:
+    parsed = urlsplit(url)
+    host = (parsed.hostname or "").lower()
+    if parsed.scheme != "https" or parsed.username or parsed.password or not (host == "curseforge.com" or host.endswith(".curseforge.com") or host.endswith(".forgecdn.net")):
+        raise HTTPException(status_code=502, detail="CurseForge returned an unsupported add-on download URL.")
+
+
+async def download_curseforge_addon(url: str) -> bytes:
+    current_url = url
+    for _ in range(6):
+        validate_curseforge_download_url(current_url)
+        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
+            async with client.stream("GET", current_url) as response:
+                if response.status_code in {301, 302, 303, 307, 308}:
+                    location = response.headers.get("location")
+                    if not location:
+                        raise HTTPException(status_code=502, detail="CurseForge returned an incomplete add-on download redirect.")
+                    current_url = urljoin(current_url, location)
+                    continue
+                response.raise_for_status()
+                try:
+                    content_length = int(response.headers.get("content-length", "0"))
+                except ValueError:
+                    content_length = 0
+                if content_length > BEDROCK_ADDON_MAX_BYTES:
+                    raise HTTPException(status_code=413, detail="Bedrock add-ons must be 32 MB or smaller.")
+                chunks: list[bytes] = []
+                total = 0
+                async for chunk in response.aiter_bytes():
+                    total += len(chunk)
+                    if total > BEDROCK_ADDON_MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="Bedrock add-ons must be 32 MB or smaller.")
+                    chunks.append(chunk)
+                if not chunks:
+                    raise HTTPException(status_code=422, detail="CurseForge returned an empty add-on file.")
+                return b"".join(chunks)
+    raise HTTPException(status_code=502, detail="CurseForge returned too many redirects while downloading this add-on.")
 
 
 @asynccontextmanager
@@ -1762,6 +2560,11 @@ async def bootstrap():
     items = [public_server(x) for x in all_configs()]
     api_ready = False
     error = DOCKER_ERROR
+    eula_acceptances = settings().get("game_eula_accepted")
+    if not isinstance(eula_acceptances, dict):
+        eula_acceptances = {}
+    eula_acceptances = dict(eula_acceptances)
+    eula_acceptances["minecraft"] = game_eula_accepted("minecraft")
     try:
         docker_client().ping()
         api_ready = True
@@ -1770,6 +2573,7 @@ async def bootstrap():
         error = str(err)
     return {
         "eula_accepted": game_eula_accepted("minecraft"),
+        "eula_acceptances": eula_acceptances,
         "games": registered_games(),
         "curseforge_key_set": bool(settings().get("curseforge_api_key")),
         "docker_ready": api_ready,
@@ -1838,9 +2642,12 @@ async def create_server(payload: dict[str, Any]):
     if driver.requires_eula and not game_eula_accepted(driver.game_id):
         raise HTTPException(status_code=409, detail=f"Complete the first-run {driver.display_name} license step before creating a server.")
     clean = validate_config({**payload, "game_id": driver.game_id})
-    kind = str(payload.get("server_type", "VANILLA")).upper()
+    default_type = "BEDROCK" if driver.game_id == "minecraft_bedrock" else "VANILLA"
+    kind = str(payload.get("server_type", default_type)).upper()
     if kind not in driver.server_types:
         raise HTTPException(status_code=422, detail=f"Choose a supported {driver.display_name} server type.")
+    if driver.game_id == "minecraft" and kind in PLUGIN_SERVER_TYPES:
+        await require_release_for_plugin_server(kind, str(clean["minecraft_version"]))
     pack_payload = payload.get("modpack")
     if kind in {"MODRINTH", "AUTO_CURSEFORGE"} and not isinstance(pack_payload, dict):
         raise HTTPException(status_code=422, detail="Choose a modpack in the Types tab.")
@@ -1877,7 +2684,7 @@ async def create_server(payload: dict[str, Any]):
     item = {
         **clean, "id": server_id, "created_at": __import__("datetime").datetime.now().isoformat(),
         "game_id": driver.game_id, "server_type": kind, "mod_loader": mod_loader,
-        "modpack": modpack, "mods": [], "plugins": [], "desired_state": "running", "job_state": "queued",
+        "modpack": modpack, "mods": [], "plugins": [], "bedrock_addons": [], "desired_state": "running", "job_state": "queued",
         "last_player_seen": time.time(), "empty_since": None, "updates_available": [],
         "last_update_check": 0, "updating": False, "auto_paused": False, "auto_stopped": False,
     }
@@ -1905,20 +2712,34 @@ async def update_server(server_id: str, payload: dict[str, Any]):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
-    if item.get("updating"):
-        raise HTTPException(status_code=409, detail="Server settings cannot be changed while the server is updating.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="Server settings cannot be changed while the server is updating, resetting, or being removed.")
     original = dict(item)
     merged = {**item, **payload}
     clean = validate_config(merged, existing_id=server_id)
+    if item.get("game_id") == "minecraft" and item.get("server_type") in PLUGIN_SERVER_TYPES and clean["minecraft_version"] != item.get("minecraft_version"):
+        await require_release_for_plugin_server(str(item["server_type"]), str(clean["minecraft_version"]))
+    icon_bytes = decode_server_icon(payload.get("server_icon_data")) if payload.get("server_icon_data") is not None else None
     was_running = item.get("desired_state") == "running"
     driver = game_driver_for(item)
-    restart_required = any(item.get(key) != clean.get(key) for key in ("name", "min_ram_mb", "max_ram_mb", *driver.restart_keys))
+    restart_required = icon_bytes is not None or any(item.get(key) != clean.get(key) for key in ("name", "min_ram_mb", "max_ram_mb", *driver.restart_keys))
+    icon_path = server_icon_path(server_id)
+    old_icon = icon_path.read_bytes() if icon_path.is_file() else None
+    if icon_bytes is not None:
+        icon_path.parent.mkdir(parents=True, exist_ok=True)
+        icon_path.write_bytes(icon_bytes)
+        item["server_icon"] = True
     item.update(clean)
     write_json(config_path(server_id), item)
     try:
         await ensure_game_networking(server_id)
     except OSError as err:
         write_json(config_path(server_id), original)
+        if icon_bytes is not None:
+            if old_icon is None:
+                icon_path.unlink(missing_ok=True)
+            else:
+                icon_path.write_bytes(old_icon)
         raise HTTPException(status_code=409, detail=f"Could not listen on TCP port {clean['port']}: {err}")
     if was_running and restart_required:
         def update_and_start():
@@ -1936,13 +2757,141 @@ async def update_server(server_id: str, payload: dict[str, Any]):
     return {"server": public_server(item), "job_id": job_id}
 
 
+def world_data_targets(server_id: str, item: dict[str, Any]) -> list[Path]:
+    data_root = (server_dir(server_id) / "data").resolve()
+    world_name = str(item.get("world_name", "Bedrock level" if item.get("game_id") == "minecraft_bedrock" else "world"))
+    if item.get("game_id") == "minecraft_bedrock":
+        targets = [data_root / "worlds" / world_name]
+    else:
+        targets = [data_root / world_name, data_root / f"{world_name}_nether", data_root / f"{world_name}_the_end"]
+    for target in targets:
+        resolved = target.resolve()
+        if data_root not in resolved.parents:
+            raise HTTPException(status_code=409, detail="The configured world path is outside this server's data folder.")
+    return targets
+
+
+@app.post("/api/servers/{server_id}/reset-world")
+async def reset_server_world(server_id: str):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is already updating, resetting, or being removed.")
+    targets = world_data_targets(server_id, item)
+    keep_running = item.get("desired_state") == "running"
+    item["world_resetting"] = True
+    item["job_state"] = "reset-queued"
+    write_json(config_path(server_id), item)
+
+    def reset_world():
+        try:
+            stop_container(server_id, remove=True, timeout=120)
+            for target in targets:
+                if target.is_symlink():
+                    target.unlink()
+                elif target.is_dir():
+                    shutil.rmtree(target)
+                elif target.exists():
+                    target.unlink()
+            latest = read_json(config_path(server_id))
+            if latest.get("game_id") == "minecraft_bedrock":
+                installed_packs = [pack for addon in latest.get("bedrock_addons", []) for pack in addon.get("packs", [])]
+                if installed_packs:
+                    data_root = (server_dir(server_id) / "data").resolve()
+                    changes = bedrock_world_pack_changes(data_root, str(latest.get("world_name", "Bedrock level")), installed_packs)
+                    write_bedrock_world_pack_changes(changes)
+            latest["world_resetting"] = False
+            latest["world_settings_applied"] = {}
+            latest["world_reset_at"] = time.time()
+            latest["job_state"] = "starting" if keep_running else "stopped"
+            write_json(config_path(server_id), latest)
+            if keep_running:
+                run_container(server_id)
+        except Exception:
+            latest = read_json(config_path(server_id))
+            if latest:
+                latest["world_resetting"] = False
+                latest["job_state"] = "reset-failed"
+                write_json(config_path(server_id), latest)
+            raise
+
+    job_id = submit_job(server_id, "reset world", reset_world)
+    return {"job_id": job_id}
+
+
+@app.get("/api/servers/{server_id}/icon")
+async def get_server_icon(server_id: str):
+    item = read_json(config_path(server_id))
+    if not item or game_driver_for(item).game_id != "minecraft":
+        raise HTTPException(status_code=404, detail="Java server icon not found.")
+    path = server_icon_path(server_id)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail="Java server icon not found.")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "no-store"})
+
+
+@app.put("/api/servers/{server_id}/icon")
+async def put_server_icon(server_id: str, payload: dict[str, Any]):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    if game_driver_for(item).game_id != "minecraft":
+        raise HTTPException(status_code=409, detail="Server icons are supported for Java Edition servers only.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is busy and cannot change its icon right now.")
+    image = decode_server_icon(payload.get("image_base64"))
+    path = server_icon_path(server_id)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(image)
+    item["server_icon"] = True
+    write_json(config_path(server_id), item)
+    was_running = item.get("desired_state") == "running"
+    if was_running:
+        def update_icon():
+            stop_container(server_id, remove=True)
+            run_container(server_id)
+        job_id = submit_job(server_id, "update server icon", update_icon)
+    else:
+        (path.parent / "server-icon.png").unlink(missing_ok=True)
+        stop_container(server_id, remove=True)
+        job_id = None
+    return {"server": public_server(item), "job_id": job_id}
+
+
+@app.delete("/api/servers/{server_id}/icon")
+async def delete_server_icon(server_id: str):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    if game_driver_for(item).game_id != "minecraft":
+        raise HTTPException(status_code=409, detail="Server icons are supported for Java Edition servers only.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is busy and cannot change its icon right now.")
+    path = server_icon_path(server_id)
+    path.unlink(missing_ok=True)
+    (path.parent / "server-icon.png").unlink(missing_ok=True)
+    item["server_icon"] = False
+    write_json(config_path(server_id), item)
+    was_running = item.get("desired_state") == "running"
+    if was_running:
+        def restart_without_icon():
+            stop_container(server_id, remove=True)
+            run_container(server_id)
+        job_id = submit_job(server_id, "remove server icon", restart_without_icon)
+    else:
+        stop_container(server_id, remove=True)
+        job_id = None
+    return {"server": public_server(item), "job_id": job_id}
+
+
 @app.post("/api/servers/{server_id}/start")
 async def start_server(server_id: str):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
-    if item.get("updating"):
-        raise HTTPException(status_code=409, detail="The server is updating.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
     original = dict(item)
     item["desired_state"] = "running"
     item["auto_stopped"] = False
@@ -1962,8 +2911,8 @@ async def stop_server(server_id: str):
     item = read_json(config_path(server_id))
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
-    if item.get("updating"):
-        raise HTTPException(status_code=409, detail="The server is updating.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
     item["desired_state"] = "stopped"
     item["auto_stopped"] = False
     item["auto_paused"] = False
@@ -1981,8 +2930,8 @@ async def update_server_now(server_id: str):
     driver = require_game_capability(item, "supports_auto_update", "Manual updates")
     if driver.game_id != "minecraft":
         raise HTTPException(status_code=409, detail=f"Manual updates are not implemented for {driver.display_name} yet.")
-    if item.get("updating"):
-        raise HTTPException(status_code=409, detail="This server is already updating.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is already updating, resetting, or being removed.")
     item["updating"] = True
     item["job_state"] = "update-queued"
     write_json(config_path(server_id), item)
@@ -2000,13 +2949,16 @@ async def install_type(server_id: str, payload: dict[str, Any]):
         raise HTTPException(status_code=409, detail=f"{driver.display_name} does not provide a server type selector.")
     if driver.game_id != "minecraft":
         raise HTTPException(status_code=409, detail=f"Server type installation is not implemented for {driver.display_name} yet.")
-    if item.get("updating"):
-        raise HTTPException(status_code=409, detail="The server is updating.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
     kind = str(payload.get("kind", "")).upper()
+    if item.get("crossplay_enabled") is True and kind not in PLUGIN_SERVER_TYPES:
+        raise HTTPException(status_code=422, detail="Bedrock cross-play needs Bukkit, Paper, or Purpur server software.")
     provider = str(payload.get("provider", "")).lower()
     requested_version = str(payload.get("minecraft_version", item.get("minecraft_version", "LATEST"))).strip()
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", requested_version):
         raise HTTPException(status_code=422, detail="Choose a valid Minecraft release or snapshot version.")
+    await require_release_for_plugin_server(kind, requested_version)
     if kind in driver.server_types and kind not in {"MODRINTH", "AUTO_CURSEFORGE"}:
         item.update({"server_type": kind, "minecraft_version": requested_version,
             "modpack": None, "mod_loader": kind if kind in MOD_LOADERS else "", "mods": []})
@@ -2049,6 +3001,122 @@ async def install_type(server_id: str, payload: dict[str, Any]):
     return {"server": public_server(item), "job_id": job_id}
 
 
+@app.post("/api/servers/{server_id}/addons")
+async def add_bedrock_addon(server_id: str, payload: dict[str, Any]):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    require_game_capability(item, "supports_addons", "Bedrock add-ons")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
+    addon = await asyncio.to_thread(parse_bedrock_addon_archive, payload.get("filename"), payload.get("content_base64"))
+    installed_ids = {
+        str(pack.get("uuid", "")).lower()
+        for entry in item.get("bedrock_addons", [])
+        for pack in entry.get("packs", [])
+    }
+    duplicate = next((pack["uuid"] for pack in addon["packs"] if pack["uuid"].lower() in installed_ids), None)
+    if duplicate:
+        raise HTTPException(status_code=409, detail=f"An add-on with pack UUID {duplicate} is already installed.")
+    addon_id = str(uuid.uuid4())
+    try:
+        job_id, busy_item = queue_bedrock_addon_change(
+            server_id,
+            "add Bedrock add-on",
+            lambda: install_bedrock_addon_files(server_id, addon_id, addon),
+        )
+    except HTTPException:
+        raise
+    return {"server": public_server(busy_item), "job_id": job_id}
+
+
+@app.post("/api/servers/{server_id}/addons/curseforge")
+async def add_curseforge_bedrock_addon(server_id: str, payload: dict[str, Any]):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    require_game_capability(item, "supports_addons", "Bedrock add-ons")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
+    project_id = str(payload.get("project_id", ""))
+    file_id = str(payload.get("file_id", ""))
+    if not project_id.isdigit() or not file_id.isdigit():
+        raise HTTPException(status_code=422, detail="Select a valid CurseForge Bedrock add-on file.")
+    key = settings().get("curseforge_api_key", "").strip()
+    if not key:
+        raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to download from CurseForge.")
+    try:
+        class_id = await curseforge_bedrock_addon_class_id()
+        headers = {"x-api-key": key, "Accept": "application/json"}
+        async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+            project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
+            project_response.raise_for_status()
+            project = project_response.json().get("data", {})
+            try:
+                project_class_id = int(project.get("classId", 0))
+            except (TypeError, ValueError):
+                project_class_id = 0
+            if project_class_id != class_id:
+                raise HTTPException(status_code=422, detail="This CurseForge project is not a Minecraft Bedrock add-on.")
+            file_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/files/{file_id}")
+            file_response.raise_for_status()
+            file_record = file_response.json().get("data", {})
+            if str(file_record.get("modId", "")) != project_id:
+                raise HTTPException(status_code=422, detail="This file does not belong to the selected CurseForge add-on.")
+            filename = str(file_record.get("fileName", ""))
+            if not filename.lower().endswith((".mcaddon", ".mcpack")) or file_record.get("isAvailable") is False:
+                raise HTTPException(status_code=422, detail="CurseForge does not have an available .mcaddon or .mcpack file for this version.")
+            url_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/files/{file_id}/download-url")
+            url_response.raise_for_status()
+            download_url = str(url_response.json().get("data", ""))
+        if not download_url:
+            raise HTTPException(status_code=502, detail="CurseForge did not provide a download URL for this add-on.")
+        archive = await download_curseforge_addon(download_url)
+        addon = await asyncio.to_thread(parse_bedrock_addon_archive, filename, base64.b64encode(archive).decode("ascii"))
+        addon["display_name"] = str(project.get("name", "")).strip()[:120]
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(status_code=502, detail=f"CurseForge returned HTTP {err.response.status_code} while preparing this add-on.")
+    except httpx.HTTPError as err:
+        raise HTTPException(status_code=502, detail=f"Could not download this CurseForge add-on: {err}")
+    installed_ids = {
+        str(pack.get("uuid", "")).lower()
+        for entry in item.get("bedrock_addons", [])
+        for pack in entry.get("packs", [])
+    }
+    duplicate = next((pack["uuid"] for pack in addon["packs"] if pack["uuid"].lower() in installed_ids), None)
+    if duplicate:
+        raise HTTPException(status_code=409, detail=f"An add-on with pack UUID {duplicate} is already installed.")
+    addon_id = str(uuid.uuid4())
+    job_id, busy_item = queue_bedrock_addon_change(
+        server_id,
+        "add CurseForge Bedrock add-on",
+        lambda: install_bedrock_addon_files(server_id, addon_id, addon),
+    )
+    return {"server": public_server(busy_item), "job_id": job_id}
+
+
+@app.delete("/api/servers/{server_id}/addons/{addon_id}")
+async def remove_bedrock_addon(server_id: str, addon_id: str):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    require_game_capability(item, "supports_addons", "Bedrock add-ons")
+    try:
+        addon_id = str(uuid.UUID(addon_id))
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail="Bedrock add-on not found.") from err
+    if not any(entry.get("id") == addon_id for entry in item.get("bedrock_addons", [])):
+        raise HTTPException(status_code=404, detail="Bedrock add-on not found.")
+    job_id, busy_item = queue_bedrock_addon_change(
+        server_id,
+        "remove Bedrock add-on",
+        lambda: remove_bedrock_addon_files(server_id, addon_id),
+    )
+    return {"server": public_server(busy_item), "job_id": job_id}
+
+
 @app.post("/api/servers/{server_id}/mods")
 async def add_mod(server_id: str, payload: dict[str, Any]):
     item = read_json(config_path(server_id))
@@ -2059,8 +3127,8 @@ async def add_mod(server_id: str, payload: dict[str, Any]):
         raise HTTPException(status_code=409, detail=f"Mod installation is not implemented for {driver.display_name} yet.")
     if server_mod_loader(item) not in MOD_LOADERS:
         raise HTTPException(status_code=409, detail="Choose a compatible mod loader or modpack in the Types tab before adding mods.")
-    if item.get("updating"):
-        raise HTTPException(status_code=409, detail="The server is updating.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
     platform = str(payload.get("platform", "")).lower()
     project = payload.get("project") or {}
     project_id = str(project.get("project_id", ""))
@@ -2108,8 +3176,8 @@ async def remove_mod(server_id: str, platform: str, project_id: str):
     driver = require_game_capability(item, "supports_mods", "Mods")
     if driver.game_id != "minecraft":
         raise HTTPException(status_code=409, detail=f"Mod removal is not implemented for {driver.display_name} yet.")
-    if item.get("updating"):
-        raise HTTPException(status_code=409, detail="The server is updating.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
     item["mods"] = [m for m in item.get("mods", []) if not (m.get("platform") == platform.lower() and m.get("project_id") == project_id)]
     was_running = item.get("desired_state") == "running"
     write_json(config_path(server_id), item)
@@ -2134,8 +3202,8 @@ async def add_plugin(server_id: str, payload: dict[str, Any]):
         raise HTTPException(status_code=409, detail=f"Plugin installation is not implemented for {driver.display_name} yet.")
     if str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
         raise HTTPException(status_code=409, detail="Choose Bukkit, Paper, or Purpur in the Types tab before adding plugins.")
-    if item.get("updating"):
-        raise HTTPException(status_code=409, detail="The server is updating.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
     platform = str(payload.get("platform", "")).lower()
     project = payload.get("project") or {}
     project_id = str(project.get("project_id", ""))
@@ -2183,8 +3251,8 @@ async def remove_plugin(server_id: str, platform: str, project_id: str):
     driver = require_game_capability(item, "supports_plugins", "Plugins")
     if driver.game_id != "minecraft":
         raise HTTPException(status_code=409, detail=f"Plugin removal is not implemented for {driver.display_name} yet.")
-    if item.get("updating"):
-        raise HTTPException(status_code=409, detail="The server is updating.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
     item["plugins"] = [plugin for plugin in item.get("plugins", []) if not (plugin.get("platform") == platform.lower() and plugin.get("project_id") == project_id)]
     was_running = item.get("desired_state") == "running"
     write_json(config_path(server_id), item)
@@ -2205,8 +3273,8 @@ async def delete_server(server_id: str):
     item = read_json(path / "server.json")
     if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
-    if item.get("updating"):
-        raise HTTPException(status_code=409, detail="The server is updating.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or already being removed.")
     item["deleting"] = True
     write_json(path / "server.json", item)
     await close_game_networking(server_id)
@@ -2228,8 +3296,11 @@ async def delete_server(server_id: str):
 
 @app.post("/api/servers/{server_id}/console")
 async def send_console_command(server_id: str, payload: dict[str, Any]):
-    if not read_json(config_path(server_id)):
+    item = read_json(config_path(server_id))
+    if not item:
         raise HTTPException(status_code=404, detail="Server not found.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
     command = str(payload.get("command", "")).strip()
     if not command or len(command) > 512 or any(ord(char) < 32 or ord(char) == 127 for char in command):
         raise HTTPException(status_code=422, detail="Enter a single server command of up to 512 characters.")
@@ -2282,12 +3353,27 @@ async def minecraft_versions(channel: str = "all"):
 
 @app.get("/api/catalog")
 async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", offset: int = 0, sort: str = "downloads"):
-    if kind not in {"mod", "modpack", "plugin"} or platform not in {"modrinth", "curseforge"}:
+    if kind not in {"mod", "modpack", "plugin", "bedrock_addon"} or platform not in {"modrinth", "curseforge"}:
         raise HTTPException(status_code=422, detail="Choose Modrinth or CurseForge and a supported category.")
     if len(q) > 100 or offset < 0:
         raise HTTPException(status_code=422, detail="Search text or page offset is invalid.")
     if sort not in {"downloads", "updated"}:
         raise HTTPException(status_code=422, detail="Sort must be downloads or updated.")
+    if kind == "bedrock_addon":
+        if platform != "curseforge":
+            raise HTTPException(status_code=422, detail="CurseForge is the supported catalog for Bedrock add-ons.")
+        item = read_json(config_path(server_id)) if server_id else None
+        if not item:
+            raise HTTPException(status_code=404, detail="Bedrock server not found.")
+        require_game_capability(item, "supports_addons", "Bedrock add-ons")
+        try:
+            return await curseforge_bedrock_addon_search(q, offset, sort)
+        except HTTPException:
+            raise
+        except httpx.HTTPStatusError as err:
+            raise HTTPException(status_code=502, detail=f"CurseForge returned HTTP {err.response.status_code}. Check API access and try again.")
+        except httpx.HTTPError as err:
+            raise HTTPException(status_code=502, detail=f"Could not reach CurseForge: {err}")
     item = read_json(config_path(server_id)) if server_id else {"minecraft_version": "LATEST", "mod_loader": ""}
     if server_id and not item:
         raise HTTPException(status_code=404, detail="Server not found.")
@@ -2307,7 +3393,7 @@ async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", of
 
 @app.get("/api/catalog/{platform}/{project_id}")
 async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", server_id: str = "", offset: int = 0):
-    if platform not in {"modrinth", "curseforge"} or kind not in {"mod", "modpack", "plugin"}:
+    if platform not in {"modrinth", "curseforge"} or kind not in {"mod", "modpack", "plugin", "bedrock_addon"}:
         raise HTTPException(status_code=422, detail="Unsupported catalog item.")
     if offset < 0:
         raise HTTPException(status_code=422, detail="Version page offset cannot be negative.")
@@ -2318,6 +3404,21 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
         raise HTTPException(status_code=422, detail="Catalog project ID is invalid.")
     if platform == "curseforge" and not project_id.isdigit():
         raise HTTPException(status_code=422, detail="CurseForge project ID must be numeric.")
+    if kind == "bedrock_addon":
+        if platform != "curseforge":
+            raise HTTPException(status_code=422, detail="CurseForge is the supported catalog for Bedrock add-ons.")
+        item = read_json(config_path(server_id)) if server_id else None
+        if not item:
+            raise HTTPException(status_code=404, detail="Bedrock server not found.")
+        require_game_capability(item, "supports_addons", "Bedrock add-ons")
+        try:
+            return await curseforge_bedrock_addon_detail(project_id, offset)
+        except HTTPException:
+            raise
+        except httpx.HTTPStatusError as err:
+            raise HTTPException(status_code=502, detail=f"CurseForge returned HTTP {err.response.status_code}.")
+        except httpx.HTTPError as err:
+            raise HTTPException(status_code=502, detail=f"Could not reach CurseForge: {err}")
     if kind == "plugin" and str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
         raise HTTPException(status_code=409, detail="Select Bukkit, Paper, or Purpur in Types before browsing plugins.")
     game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""

@@ -81,7 +81,6 @@ MINECRAFT_VERSION_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None}
 BEDROCK_ADDON_MAX_BYTES = 32 * 1024 * 1024
 BEDROCK_ADDON_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 BEDROCK_ADDON_MAX_FILES = 10000
-CURSEFORGE_BEDROCK_ADDON_CLASS: int | None = None
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -2405,9 +2404,7 @@ async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: i
 
 
 async def curseforge_bedrock_addon_class_id() -> int:
-    global CURSEFORGE_BEDROCK_ADDON_CLASS
-    if CURSEFORGE_BEDROCK_ADDON_CLASS is not None:
-        return CURSEFORGE_BEDROCK_ADDON_CLASS
+    # CurseForge's API terms prohibit caching API data; resolve this only when the user browses Bedrock add-ons.
     key = current_curseforge_api_key()
     if not key:
         raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
@@ -2421,10 +2418,9 @@ async def curseforge_bedrock_addon_class_id() -> int:
         names = {re.sub(r"[^a-z0-9]", "", str(category.get(field, "")).lower()) for field in ("slug", "name")}
         if names & {"addon", "addons", "bedrockaddon", "bedrockaddons"}:
             try:
-                CURSEFORGE_BEDROCK_ADDON_CLASS = int(category.get("id", category.get("classId")))
+                return int(category.get("id", category.get("classId")))
             except (TypeError, ValueError):
                 continue
-            return CURSEFORGE_BEDROCK_ADDON_CLASS
     raise HTTPException(status_code=502, detail="CurseForge did not return the Minecraft Bedrock Add-ons category. Check the API key and try again.")
 
 

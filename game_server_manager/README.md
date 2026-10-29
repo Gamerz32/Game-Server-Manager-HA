@@ -1,6 +1,6 @@
 # Game Server Manager
 
-Manage Minecraft Java and Bedrock servers from a Home Assistant ingress dashboard. Java servers use <code>itzg/minecraft-server</code>; Bedrock Dedicated Servers use <code>itzg/minecraft-bedrock-server</code>. Each server has its own persistent world directory. Java servers can also be created with Geyser and Floodgate for Bedrock cross-play.
+Manage dedicated game servers from a Home Assistant ingress dashboard. Minecraft Java, Bedrock, and Java/Bedrock cross-play are available now. Worms Armageddon appears in the game picker as WIP and is unavailable. Minecraft Java servers use <code>itzg/minecraft-server</code>; Bedrock Dedicated Servers use <code>itzg/minecraft-bedrock-server</code>. Each Minecraft server has its own persistent world directory.
 
 ## Dashboard
 

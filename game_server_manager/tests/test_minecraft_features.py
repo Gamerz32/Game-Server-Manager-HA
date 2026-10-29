@@ -171,6 +171,15 @@ class SecurityRegressionTests(unittest.TestCase):
                 main.save_settings({"eula_accepted": True, "curseforge_api_key": "new-secret"})
                 self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8")), {"eula_accepted": True})
 
+    def test_interrupted_legacy_settings_temp_file_is_removed_at_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "manager-settings.json"
+            temporary_path = settings_path.with_suffix(settings_path.suffix + ".tmp")
+            temporary_path.write_text('{"curseforge_api_key":"interrupted-secret"}', encoding="utf-8")
+            with patch.object(main, "SETTINGS_FILE", settings_path):
+                main.scrub_legacy_settings()
+            self.assertFalse(temporary_path.exists())
+
     def test_curseforge_key_setting_is_memory_only(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             settings_path = Path(temp_dir) / "manager-settings.json"

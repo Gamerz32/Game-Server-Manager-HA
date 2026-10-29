@@ -193,6 +193,13 @@ def current_curseforge_api_key() -> str:
     return CURSEFORGE_API_KEY
 
 
+def scrub_legacy_settings() -> None:
+    # An interrupted legacy write could leave the plaintext key in this sibling temp file.
+    temporary_settings = SETTINGS_FILE.with_suffix(SETTINGS_FILE.suffix + ".tmp")
+    temporary_settings.unlink(missing_ok=True)
+    settings()
+
+
 def game_driver_for(item: dict[str, Any]):
     game_id = str(item.get("game_id") or "minecraft").strip().lower()
     try:
@@ -2516,7 +2523,7 @@ async def lifespan(app: FastAPI):
     global HOST_NETWORKING_ENABLED, GATEWAY_SECRET
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SERVERS_DIR.mkdir(parents=True, exist_ok=True)
-    settings()  # Scrub plaintext API keys written by versions before the memory-only setting.
+    scrub_legacy_settings()
     HOST_NETWORKING_ENABLED = bool(read_json(OPTIONS_FILE, {}).get("host_networking", False))
     GATEWAY_SECRET = secrets.token_hex(32)
     try:

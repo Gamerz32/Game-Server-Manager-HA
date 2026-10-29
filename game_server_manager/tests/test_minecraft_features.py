@@ -5,11 +5,12 @@ import base64
 import io
 import json
 import sys
+import tempfile
 import uuid
 import zipfile
 from pathlib import Path
 import unittest
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -156,6 +157,89 @@ class WorldAndSnapshotTests(unittest.TestCase):
         with patch.object(main, "minecraft_manifest", new=AsyncMock(return_value=manifest)):
             with self.assertRaisesRegex(main.HTTPException, "snapshots are not supported"):
                 asyncio.run(main.require_release_for_plugin_server("BUKKIT", "1.22-test"))
+
+
+class SecurityRegressionTests(unittest.TestCase):
+    def test_legacy_curseforge_key_is_removed_from_persistent_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "manager-settings.json"
+            settings_path.write_text(json.dumps({"eula_accepted": True, "curseforge_api_key": "old-secret"}), encoding="utf-8")
+            with patch.object(main, "SETTINGS_FILE", settings_path):
+                self.assertEqual(main.settings(), {"eula_accepted": True})
+                self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8")), {"eula_accepted": True})
+
+                main.save_settings({"eula_accepted": True, "curseforge_api_key": "new-secret"})
+                self.assertEqual(json.loads(settings_path.read_text(encoding="utf-8")), {"eula_accepted": True})
+
+    def test_interrupted_legacy_settings_temp_file_is_removed_at_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "manager-settings.json"
+            temporary_path = settings_path.with_suffix(settings_path.suffix + ".tmp")
+            temporary_path.write_text('{"curseforge_api_key":"interrupted-secret"}', encoding="utf-8")
+            with patch.object(main, "SETTINGS_FILE", settings_path):
+                main.scrub_legacy_settings()
+            self.assertFalse(temporary_path.exists())
+
+    def test_curseforge_key_setting_is_memory_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            settings_path = Path(temp_dir) / "manager-settings.json"
+            with patch.object(main, "SETTINGS_FILE", settings_path), patch.object(main, "CURSEFORGE_API_KEY", ""):
+                result = asyncio.run(main.put_settings({"curseforge_api_key": "temporary-test-key"}))
+                self.assertEqual(result, {"curseforge_key_set": True})
+                self.assertEqual(main.current_curseforge_api_key(), "temporary-test-key")
+                self.assertFalse(settings_path.exists())
+
+    def test_dockerhub_reference_parser_rejects_path_and_registry_injection(self) -> None:
+        invalid_references = (
+            "docker.io/library/../other",
+            "docker.io/library/image?next=/other",
+            "docker.io/library/image#fragment",
+            "docker.io/library/image:tag/../../other",
+            "docker.io.evil.example/library/image",
+            "ghcr.io/owner/image:latest",
+            "docker.io/library/image@sha256:invalid",
+        )
+        for image in invalid_references:
+            with self.subTest(image=image):
+                self.assertIsNone(main.parse_dockerhub_image_reference(image))
+
+        with patch.object(main.httpx, "get") as get, patch.object(main.httpx, "head") as head:
+            self.assertIsNone(main.dockerhub_latest_digest("docker.io/library/../other"))
+            get.assert_not_called()
+            head.assert_not_called()
+
+    def test_dockerhub_reference_parser_preserves_supported_images(self) -> None:
+        self.assertEqual(main.parse_dockerhub_image_reference("docker.io/itzg/minecraft-server:java21"),
+                         ("itzg/minecraft-server", "java21"))
+        self.assertEqual(main.parse_dockerhub_image_reference("ubuntu"), ("library/ubuntu", "latest"))
+        self.assertEqual(main.parse_dockerhub_image_reference("evil/docker.io/image"),
+                         ("evil/docker.io/image", "latest"))
+
+        auth_response = Mock()
+        auth_response.json.return_value = {"token": "registry-token"}
+        manifest_response = Mock()
+        manifest_response.headers = {"Docker-Content-Digest": "sha256:" + "a" * 64}
+        with patch.object(main.httpx, "get", return_value=auth_response) as get, \
+                patch.object(main.httpx, "head", return_value=manifest_response) as head:
+            result = main.dockerhub_latest_digest("docker.io/itzg/minecraft-server:java21")
+
+        self.assertEqual(result, "sha256:" + "a" * 64)
+        self.assertEqual(get.call_args.kwargs["params"]["scope"], "repository:itzg/minecraft-server:pull")
+        self.assertEqual(head.call_args.args[0],
+                         "https://registry-1.docker.io/v2/itzg/minecraft-server/manifests/java21")
+
+    def test_bootstrap_returns_generic_docker_error(self) -> None:
+        secret_error = "private-daemon-path and bearer-secret"
+        with patch.object(main, "all_configs", return_value=[]), \
+                patch.object(main, "settings", return_value={}), \
+                patch.object(main, "DOCKER_ERROR", "old-private-error"), \
+                patch.object(main, "docker_client") as client:
+            client.return_value.ping.side_effect = RuntimeError(secret_error)
+            response = asyncio.run(main.bootstrap())
+
+        self.assertEqual(response["docker_error"], main.DOCKER_UNAVAILABLE_MESSAGE)
+        self.assertNotIn(secret_error, json.dumps(response))
+        self.assertNotIn("old-private-error", json.dumps(response))
 
 
 if __name__ == "__main__":

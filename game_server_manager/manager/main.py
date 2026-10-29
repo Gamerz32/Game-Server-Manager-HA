@@ -93,6 +93,8 @@ DOCKER_CLIENT_LOCK = threading.Lock()
 SERVER_LOCKS: dict[str, threading.Lock] = {}
 SERVER_LOCKS_LOCK = threading.Lock()
 SHUTTING_DOWN = False
+CURSEFORGE_API_KEY = ""
+DOCKER_UNAVAILABLE_MESSAGE = "Docker Engine is unavailable. Check the add-on logs for details."
 
 
 def docker_client() -> docker.DockerClient:
@@ -173,11 +175,29 @@ def write_json(path: Path, value: dict[str, Any], secret: bool = False) -> None:
 
 
 def settings() -> dict[str, Any]:
-    return read_json(SETTINGS_FILE, {"eula_accepted": False, "curseforge_api_key": ""})
+    value = read_json(SETTINGS_FILE, {"eula_accepted": False})
+    if "curseforge_api_key" in value:
+        # Remove keys persisted by older versions. CurseForge credentials are now memory-only.
+        value.pop("curseforge_api_key", None)
+        save_settings(value)
+    return value
 
 
 def save_settings(value: dict[str, Any]) -> None:
-    write_json(SETTINGS_FILE, value, secret=True)
+    persisted = dict(value)
+    persisted.pop("curseforge_api_key", None)
+    write_json(SETTINGS_FILE, persisted, secret=True)
+
+
+def current_curseforge_api_key() -> str:
+    return CURSEFORGE_API_KEY
+
+
+def scrub_legacy_settings() -> None:
+    # An interrupted legacy write could leave the plaintext key in this sibling temp file.
+    temporary_settings = SETTINGS_FILE.with_suffix(SETTINGS_FILE.suffix + ".tmp")
+    temporary_settings.unlink(missing_ok=True)
+    settings()
 
 
 def game_driver_for(item: dict[str, Any]):
@@ -1773,7 +1793,7 @@ def provider_update(item: dict[str, Any], platform: str, project_id: str, curren
                         "version_id": latest_id, "name": str(version.get("name") or version.get("version_number") or "New version")}
                 break
         else:
-            api_key = settings().get("curseforge_api_key", "").strip()
+            api_key = current_curseforge_api_key()
             if not project_id.isdigit():
                 return None
             if not api_key:
@@ -1804,17 +1824,51 @@ def provider_update(item: dict[str, Any], platform: str, project_id: str, curren
     return None
 
 
-def dockerhub_latest_digest(image: str) -> str | None:
-    reference = image.rsplit("@", 1)[0]
-    repository, separator, tag = reference.rpartition(":")
-    if not separator:
-        repository, tag = reference, "latest"
-    if repository.startswith("docker.io/"):
-        repository = repository[len("docker.io/"):]
-    if not repository or ("." in repository.split("/", 1)[0] and "/" in repository):
+def parse_dockerhub_image_reference(image: str) -> tuple[str, str] | None:
+    """Accept Docker Hub image references and return a safe repo path and tag."""
+    if not isinstance(image, str):
         return None
-    if "/" not in repository:
+    reference = image.strip()
+    if not reference or any(character.isspace() for character in reference) or reference.count("@") > 1:
+        return None
+    if "@" in reference:
+        reference, digest = reference.split("@", 1)
+        if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+            return None
+
+    last_slash = reference.rfind("/")
+    last_colon = reference.rfind(":")
+    if last_colon > last_slash:
+        name, tag = reference[:last_colon], reference[last_colon + 1:]
+        if not re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}", tag):
+            return None
+    else:
+        name, tag = reference, "latest"
+
+    if not name or len(name) > 255:
+        return None
+    components = name.split("/")
+    registry = components[0]
+    if registry in {"docker.io", "index.docker.io"}:
+        components = components[1:]
+    elif registry == "localhost" or "." in registry or ":" in registry:
+        # This helper only queries Docker Hub, never arbitrary registries.
+        return None
+    component_pattern = re.compile(r"[a-z0-9]+(?:(?:[._]|__|-+)[a-z0-9]+)*")
+    if not components or any(not component_pattern.fullmatch(part) for part in components):
+        return None
+
+    repository = "/".join(components)
+    if len(components) == 1:
         repository = f"library/{repository}"
+    return repository, tag
+
+
+def dockerhub_latest_digest(image: str) -> str | None:
+    parsed = parse_dockerhub_image_reference(image)
+    if parsed is None:
+        return None
+    repository, tag = parsed
     try:
         auth = httpx.get(
             "https://auth.docker.io/token",
@@ -2194,7 +2248,7 @@ async def validate_pack_version(platform: str, project_id: str, version_id: str,
     if platform == "curseforge":
         if not file_id or not file_id.isdigit():
             raise HTTPException(status_code=422, detail="Select a CurseForge modpack file version.")
-        key = settings().get("curseforge_api_key", "").strip()
+        key = current_curseforge_api_key()
         if not key:
             raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to use CurseForge.")
         async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
@@ -2228,7 +2282,7 @@ async def validate_mod_version(platform: str, project_id: str, version_id: str, 
     if platform == "curseforge":
         if not file_id or not file_id.isdigit():
             raise HTTPException(status_code=422, detail="Select a CurseForge mod file version.")
-        key = settings().get("curseforge_api_key", "").strip()
+        key = current_curseforge_api_key()
         if not key:
             raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to use CurseForge.")
         async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
@@ -2259,7 +2313,7 @@ async def validate_plugin_version(platform: str, project_id: str, version_id: st
     if platform == "curseforge":
         if not file_id or not file_id.isdigit():
             raise HTTPException(status_code=422, detail="Select a CurseForge plugin file version.")
-        key = settings().get("curseforge_api_key", "").strip()
+        key = current_curseforge_api_key()
         if not key:
             raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to use CurseForge.")
         async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
@@ -2299,7 +2353,7 @@ async def curseforge_bedrock_addon_class_id() -> int:
     global CURSEFORGE_BEDROCK_ADDON_CLASS
     if CURSEFORGE_BEDROCK_ADDON_CLASS is not None:
         return CURSEFORGE_BEDROCK_ADDON_CLASS
-    key = settings().get("curseforge_api_key", "").strip()
+    key = current_curseforge_api_key()
     if not key:
         raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
     async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
@@ -2320,7 +2374,7 @@ async def curseforge_bedrock_addon_class_id() -> int:
 
 
 async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset: int, sort: str) -> dict[str, Any]:
-    key = settings().get("curseforge_api_key", "").strip()
+    key = current_curseforge_api_key()
     if not key:
         raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
     sort_field = 6 if sort == "downloads" else 3
@@ -2364,7 +2418,7 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
 
 
 async def curseforge_bedrock_addon_search(query: str, offset: int, sort: str) -> dict[str, Any]:
-    key = settings().get("curseforge_api_key", "").strip()
+    key = current_curseforge_api_key()
     if not key:
         raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
     class_id = await curseforge_bedrock_addon_class_id()
@@ -2384,7 +2438,7 @@ async def curseforge_bedrock_addon_search(query: str, offset: int, sort: str) ->
 
 
 async def curseforge_bedrock_addon_detail(project_id: str, offset: int) -> dict[str, Any]:
-    key = settings().get("curseforge_api_key", "").strip()
+    key = current_curseforge_api_key()
     if not key:
         raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
     class_id = await curseforge_bedrock_addon_class_id()
@@ -2469,6 +2523,7 @@ async def lifespan(app: FastAPI):
     global HOST_NETWORKING_ENABLED, GATEWAY_SECRET
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SERVERS_DIR.mkdir(parents=True, exist_ok=True)
+    scrub_legacy_settings()
     HOST_NETWORKING_ENABLED = bool(read_json(OPTIONS_FILE, {}).get("host_networking", False))
     GATEWAY_SECRET = secrets.token_hex(32)
     try:
@@ -2492,7 +2547,7 @@ async def lifespan(app: FastAPI):
             if item.get("desired_state") == "running":
                 submit_job(item["id"], "resume", lambda sid=item["id"]: ensure_running(sid))
     except Exception as err:
-        DOCKER_ERROR = str(err)
+        DOCKER_ERROR = DOCKER_UNAVAILABLE_MESSAGE
         LOG.error("Docker Engine is unavailable or required game networking could not start: %s", err)
     MAINTENANCE_TASK = asyncio.create_task(maintenance_loop())
     yield
@@ -2570,12 +2625,13 @@ async def bootstrap():
         api_ready = True
         error = None
     except Exception as err:
-        error = str(err)
+        error = DOCKER_UNAVAILABLE_MESSAGE
+        LOG.warning("Docker Engine health check failed during dashboard bootstrap: %s", err)
     return {
         "eula_accepted": game_eula_accepted("minecraft"),
         "eula_acceptances": eula_acceptances,
         "games": registered_games(),
-        "curseforge_key_set": bool(settings().get("curseforge_api_key")),
+        "curseforge_key_set": bool(current_curseforge_api_key()),
         "docker_ready": api_ready,
         "docker_error": error,
         "host_networking_enabled": HOST_NETWORKING_ENABLED,
@@ -2609,17 +2665,14 @@ async def setup(payload: dict[str, Any]):
 
 @app.get("/api/settings")
 async def get_settings():
-    value = settings()
-    return {"curseforge_key_set": bool(value.get("curseforge_api_key"))}
+    return {"curseforge_key_set": bool(current_curseforge_api_key())}
 
 
 @app.put("/api/settings")
 async def put_settings(payload: dict[str, Any]):
-    current = settings()
-    api_key = str(payload.get("curseforge_api_key", "")).strip()
-    current["curseforge_api_key"] = api_key
-    save_settings(current)
-    return {"curseforge_key_set": bool(api_key)}
+    global CURSEFORGE_API_KEY
+    CURSEFORGE_API_KEY = str(payload.get("curseforge_api_key", "")).strip()
+    return {"curseforge_key_set": bool(CURSEFORGE_API_KEY)}
 
 
 @app.get("/api/games")
@@ -3042,7 +3095,7 @@ async def add_curseforge_bedrock_addon(server_id: str, payload: dict[str, Any]):
     file_id = str(payload.get("file_id", ""))
     if not project_id.isdigit() or not file_id.isdigit():
         raise HTTPException(status_code=422, detail="Select a valid CurseForge Bedrock add-on file.")
-    key = settings().get("curseforge_api_key", "").strip()
+    key = current_curseforge_api_key()
     if not key:
         raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to download from CurseForge.")
     try:
@@ -3439,7 +3492,7 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
                 "platform": platform, "loaders": project.get("loaders", []),
                 "versions": [modrinth_version_record(v, kind, game, loader) for v in page],
                 "version_offset": offset, "total_versions": total, "has_more": offset + len(page) < total}
-        key = settings().get("curseforge_api_key", "").strip()
+        key = current_curseforge_api_key()
         if not key:
             raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
         headers = {"x-api-key": key, "Accept": "application/json"}

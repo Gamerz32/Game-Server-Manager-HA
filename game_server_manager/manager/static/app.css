@@ -179,7 +179,7 @@
 
 .check-row.check-disabled{opacity:.5;cursor:not-allowed}.check-row.check-disabled input{cursor:not-allowed}.form-help{grid-column:1/-1;margin-top:-8px;color:var(--muted);font-size:11px;line-height:1.5}
 
-.game-tabs{display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--line);margin:15px 0 10px}.game-tab{position:relative;border:0;background:transparent;color:#f1f4f5;padding:9px 13px;font-size:13px;font-weight:650}.game-tab::after{content:"";position:absolute;bottom:-1px;left:10px;right:10px;height:2px;border-radius:2px;background:var(--blue)}.game-tabs-note{margin-left:auto;color:var(--muted);font-size:11px;font-style:italic}@media(max-width:480px){.game-tabs{align-items:flex-start;flex-wrap:wrap}.game-tabs-note{margin-left:0;padding:0 12px 10px}}
+.game-tabs{display:flex;align-items:center;gap:12px;border-bottom:1px solid var(--line);margin:15px 0 10px}.game-tab{position:relative;border:0;background:transparent;color:#f1f4f5;padding:9px 13px;font-size:13px;font-weight:650}.game-tab::after{content:"";position:absolute;bottom:-1px;left:10px;right:10px;height:2px;border-radius:2px;background:var(--blue)}.game-tab:disabled{color:var(--muted);opacity:.72;cursor:not-allowed}.game-tab:disabled::after{display:none}.wip-pill{display:inline-block;margin-left:7px;padding:2px 6px;border:1px solid var(--line);border-radius:999px;color:var(--muted);font-size:10px;font-weight:600;white-space:nowrap}.game-tabs-note{margin-left:auto;color:var(--muted);font-size:11px;font-style:italic}@media(max-width:480px){.game-tabs{align-items:flex-start;flex-wrap:wrap}.game-tabs-note{margin-left:0;padding:0 12px 10px}}
 
 /* HA Plus Islands: Lovelace cards with contained, image-led accents. */
 .card-art>.status-pill{position:relative;z-index:1}

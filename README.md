@@ -1,6 +1,6 @@
 # Game Server Manager for Home Assistant
 
-Game Server Manager adds a Home Assistant dashboard for creating and managing Minecraft Java and Bedrock servers, including Java servers that accept Bedrock players through cross-play.
+Game Server Manager adds a Home Assistant dashboard for creating and managing game servers. Minecraft Java, Bedrock, and cross-play are available now; Worms Armageddon appears as a work-in-progress option and cannot be created yet.
 
 Java servers run in their own [itzg/minecraft-server](https://docker-minecraft-server.readthedocs.io/en/latest/) container. Bedrock servers run in [itzg/minecraft-bedrock-server](https://github.com/itzg/docker-minecraft-bedrock-server). Each server has persistent world data.
 

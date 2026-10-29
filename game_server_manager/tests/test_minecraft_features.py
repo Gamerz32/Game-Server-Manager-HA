@@ -61,10 +61,15 @@ class MinecraftDriverTests(unittest.TestCase):
         item = {"server_type": "PAPER", "crossplay_enabled": True, "crossplay_port": 19133}
         environment = MINECRAFT_DRIVER.environment_for(item, {})
         self.assertEqual(environment["MODRINTH_PROJECTS"], "geyser\nfloodgate")
+        self.assertEqual(environment["MODRINTH_PROJECTS_DEFAULT_VERSION_TYPE"], "beta")
         self.assertEqual(MINECRAFT_DRIVER.container_port_bindings(item), {
             "19132/tcp": 19133,
             "19132/udp": 19133,
         })
+
+    def test_non_crossplay_does_not_change_modrinth_version_type(self) -> None:
+        environment = MINECRAFT_DRIVER.environment_for({"server_type": "PAPER"}, {})
+        self.assertNotIn("MODRINTH_PROJECTS_DEFAULT_VERSION_TYPE", environment)
 
 
 class BedrockDriverTests(unittest.TestCase):

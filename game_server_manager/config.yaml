@@ -1,8 +1,8 @@
 name: "Game Server Manager"
 slug: game_server_manager
 description: >
-  Manage multiple game servers from a Home Assistant dashboard. Minecraft Java is supported today, with room to add more games later.
-version: "2.6.0"
+  Manage Minecraft Java and Bedrock servers, including cross-play through Geyser and Floodgate.
+version: "2.8.0"
 url: https://github.com/Gamerz32/Game-Server-Manager-HA
 
 arch:

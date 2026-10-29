@@ -141,11 +141,11 @@ class MinecraftDriver:
         plugin_types = {"BUKKIT", "PAPER", "PURPUR"}
         if str(item.get("server_type", "")).upper() in plugin_types:
             if item.get("crossplay_enabled") is True:
-                # Geyser/Floodgate currently publish beta builds; this setting still allows releases.
-                env["MODRINTH_PROJECTS_DEFAULT_VERSION_TYPE"] = "beta"
-                # Install the official Geyser and Floodgate plugins automatically.
-                # Geyser detects Floodgate and enables its authentication support.
-                modrinth_projects.extend(["geyser", "floodgate"])
+                # Download the official Paper/Spigot plugin builds directly from GeyserMC.
+                env["PLUGINS"] = "\n".join([
+                    "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot",
+                    "https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot",
+                ])
             for plugin in item.get("plugins", []):
                 if plugin.get("platform") != "modrinth":
                     continue

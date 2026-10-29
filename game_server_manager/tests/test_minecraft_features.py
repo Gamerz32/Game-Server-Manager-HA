@@ -60,15 +60,20 @@ class MinecraftDriverTests(unittest.TestCase):
     def test_crossplay_installs_geyser_and_floodgate_and_publishes_bedrock_port(self) -> None:
         item = {"server_type": "PAPER", "crossplay_enabled": True, "crossplay_port": 19133}
         environment = MINECRAFT_DRIVER.environment_for(item, {})
-        self.assertEqual(environment["MODRINTH_PROJECTS"], "geyser\nfloodgate")
-        self.assertEqual(environment["MODRINTH_PROJECTS_DEFAULT_VERSION_TYPE"], "beta")
+        self.assertEqual(environment["PLUGINS"], "\n".join([
+            "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot",
+            "https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot",
+        ]))
+        self.assertNotIn("MODRINTH_PROJECTS", environment)
+        self.assertNotIn("MODRINTH_PROJECTS_DEFAULT_VERSION_TYPE", environment)
         self.assertEqual(MINECRAFT_DRIVER.container_port_bindings(item), {
             "19132/tcp": 19133,
             "19132/udp": 19133,
         })
 
-    def test_non_crossplay_does_not_change_modrinth_version_type(self) -> None:
+    def test_non_crossplay_keeps_standard_plugin_and_modrinth_settings(self) -> None:
         environment = MINECRAFT_DRIVER.environment_for({"server_type": "PAPER"}, {})
+        self.assertNotIn("PLUGINS", environment)
         self.assertNotIn("MODRINTH_PROJECTS_DEFAULT_VERSION_TYPE", environment)
 
 

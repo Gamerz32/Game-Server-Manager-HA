@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 from html.parser import HTMLParser
 from pathlib import Path, PurePosixPath
 from typing import Any
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import quote, urljoin, urlsplit
 
 import docker
 import httpx
@@ -81,7 +81,6 @@ MINECRAFT_VERSION_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None}
 BEDROCK_ADDON_MAX_BYTES = 32 * 1024 * 1024
 BEDROCK_ADDON_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 BEDROCK_ADDON_MAX_FILES = 10000
-CURSEFORGE_BEDROCK_ADDON_CLASS: int | None = None
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -2114,8 +2113,54 @@ def clean_description(value: str) -> str:
 
 
 def modrinth_headers() -> dict[str, str]:
-    return {"User-Agent": "Gamerz32/Home-Assistant-Gameservers-ADDONS/2.0.0 (Home Assistant app)"}
+    return {"User-Agent": "Gamerz32/Home-Assistant-Gameservers-ADDONS/2.8.5 (Home Assistant app)"}
 
+
+def modrinth_author_links(team_members: Any) -> list[dict[str, str]]:
+    members = team_members if isinstance(team_members, list) else []
+    ordered = sorted(
+        (member for member in members if isinstance(member, dict)),
+        key=lambda member: 0 if str(member.get("role", "")).lower() == "owner" else 1,
+    )
+    authors: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for member in ordered:
+        user = member.get("user")
+        if not isinstance(user, dict):
+            continue
+        username = str(user.get("username", "")).strip()
+        key = username.casefold()
+        if not username or key in seen:
+            continue
+        seen.add(key)
+        authors.append({
+            "name": str(user.get("name") or username).strip()[:100],
+            "url": f"https://modrinth.com/user/{quote(username, safe='')}",
+        })
+    return authors[:20]
+
+
+def curseforge_author_links(project: dict[str, Any]) -> list[dict[str, str]]:
+    raw_authors = project.get("authors", [])
+    authors: list[dict[str, str]] = []
+    if not isinstance(raw_authors, list):
+        return authors
+    for author in raw_authors:
+        if not isinstance(author, dict):
+            continue
+        name = str(author.get("name", "")).strip()
+        if not name:
+            continue
+        authors.append({"name": name[:100], "url": str(author.get("url", "")).strip()[:2048]})
+    return authors[:20]
+
+
+def require_curseforge_distribution(project: dict[str, Any]) -> None:
+    if project.get("allowModDistribution") is False:
+        raise HTTPException(
+            status_code=403,
+            detail="The author has disabled third-party distribution for this CurseForge project.",
+        )
 
 
 def canonical_mod_loader(value: Any) -> str:
@@ -2252,6 +2297,9 @@ async def validate_pack_version(platform: str, project_id: str, version_id: str,
         if not key:
             raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to use CurseForge.")
         async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
+            project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
+            project_response.raise_for_status()
+            require_curseforge_distribution(project_response.json().get("data", {}))
             response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/files/{file_id}")
             response.raise_for_status()
             version = response.json().get("data", {})
@@ -2286,6 +2334,9 @@ async def validate_mod_version(platform: str, project_id: str, version_id: str, 
         if not key:
             raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to use CurseForge.")
         async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
+            project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
+            project_response.raise_for_status()
+            require_curseforge_distribution(project_response.json().get("data", {}))
             response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/files/{file_id}")
             response.raise_for_status()
             version = response.json().get("data", {})
@@ -2317,6 +2368,9 @@ async def validate_plugin_version(platform: str, project_id: str, version_id: st
         if not key:
             raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to use CurseForge.")
         async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
+            project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
+            project_response.raise_for_status()
+            require_curseforge_distribution(project_response.json().get("data", {}))
             response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/files/{file_id}")
             response.raise_for_status()
             version = response.json().get("data", {})
@@ -2350,9 +2404,7 @@ async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: i
 
 
 async def curseforge_bedrock_addon_class_id() -> int:
-    global CURSEFORGE_BEDROCK_ADDON_CLASS
-    if CURSEFORGE_BEDROCK_ADDON_CLASS is not None:
-        return CURSEFORGE_BEDROCK_ADDON_CLASS
+    # CurseForge's API terms prohibit caching API data; resolve this only when the user browses Bedrock add-ons.
     key = current_curseforge_api_key()
     if not key:
         raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
@@ -2366,10 +2418,9 @@ async def curseforge_bedrock_addon_class_id() -> int:
         names = {re.sub(r"[^a-z0-9]", "", str(category.get(field, "")).lower()) for field in ("slug", "name")}
         if names & {"addon", "addons", "bedrockaddon", "bedrockaddons"}:
             try:
-                CURSEFORGE_BEDROCK_ADDON_CLASS = int(category.get("id", category.get("classId")))
+                return int(category.get("id", category.get("classId")))
             except (TypeError, ValueError):
                 continue
-            return CURSEFORGE_BEDROCK_ADDON_CLASS
     raise HTTPException(status_code=502, detail="CurseForge did not return the Minecraft Bedrock Add-ons category. Check the API key and try again.")
 
 
@@ -2388,6 +2439,8 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
     loader_id = CF_LOADER_IDS.get(server_mod_loader(item))
     hits = []
     for project in data.get("data", []):
+        if project.get("allowModDistribution") is False:
+            continue
         indexes = project.get("latestFilesIndexes", []) or []
         compatible = None
         if kind == "mod" and game:
@@ -2430,6 +2483,8 @@ async def curseforge_bedrock_addon_search(query: str, offset: int, sort: str) ->
         data = response.json()
     hits = []
     for project in data.get("data", []):
+        if project.get("allowModDistribution") is False:
+            continue
         hits.append({"project_id": str(project["id"]), "slug": project.get("slug", str(project["id"])),
             "title": project.get("name", "CurseForge add-on"), "description": project.get("summary", ""),
             "icon": (project.get("logo") or {}).get("url", ""), "downloads": project.get("downloadCount", 0),
@@ -2447,6 +2502,7 @@ async def curseforge_bedrock_addon_detail(project_id: str, offset: int) -> dict[
         project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
         project_response.raise_for_status()
         project = project_response.json().get("data", {})
+        require_curseforge_distribution(project)
         try:
             project_class_id = int(project.get("classId", 0))
         except (TypeError, ValueError):
@@ -2473,7 +2529,8 @@ async def curseforge_bedrock_addon_detail(project_id: str, offset: int) -> dict[
     next_offset = offset + len(files)
     return {"project_id": str(project.get("id", project_id)), "slug": project.get("slug", str(project_id)),
         "title": project.get("name", ""), "description": description or project.get("summary", ""),
-        "icon": (project.get("logo") or {}).get("url", ""), "platform": "curseforge", "versions": versions,
+        "icon": (project.get("logo") or {}).get("url", ""), "platform": "curseforge",
+        "authors": curseforge_author_links(project), "versions": versions,
         "version_offset": offset, "next_offset": next_offset, "total_versions": total, "has_more": next_offset < total,
         "website_url": (project.get("links") or {}).get("websiteUrl", "")}
 
@@ -2485,11 +2542,13 @@ def validate_curseforge_download_url(url: str) -> None:
         raise HTTPException(status_code=502, detail="CurseForge returned an unsupported add-on download URL.")
 
 
-async def download_curseforge_addon(url: str) -> bytes:
+async def download_curseforge_addon(url: str, api_key: str) -> bytes:
     current_url = url
     for _ in range(6):
         validate_curseforge_download_url(current_url)
-        async with httpx.AsyncClient(timeout=60, follow_redirects=False) as client:
+        host = (urlsplit(current_url).hostname or "").lower()
+        headers = {"x-api-key": api_key} if host == "edge.forgecdn.net" or host.endswith(".forgecdn.net") else {}
+        async with httpx.AsyncClient(timeout=60, follow_redirects=False, headers=headers) as client:
             async with client.stream("GET", current_url) as response:
                 if response.status_code in {301, 302, 303, 307, 308}:
                     location = response.headers.get("location")
@@ -3105,6 +3164,7 @@ async def add_curseforge_bedrock_addon(server_id: str, payload: dict[str, Any]):
             project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
             project_response.raise_for_status()
             project = project_response.json().get("data", {})
+            require_curseforge_distribution(project)
             try:
                 project_class_id = int(project.get("classId", 0))
             except (TypeError, ValueError):
@@ -3124,7 +3184,7 @@ async def add_curseforge_bedrock_addon(server_id: str, payload: dict[str, Any]):
             download_url = str(url_response.json().get("data", ""))
         if not download_url:
             raise HTTPException(status_code=502, detail="CurseForge did not provide a download URL for this add-on.")
-        archive = await download_curseforge_addon(download_url)
+        archive = await download_curseforge_addon(download_url, key)
         addon = await asyncio.to_thread(parse_bedrock_addon_archive, filename, base64.b64encode(archive).decode("ascii"))
         addon["display_name"] = str(project.get("name", "")).strip()[:120]
     except HTTPException:
@@ -3485,11 +3545,22 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
                 versions_response = await client.get(f"{MODRINTH_BASE}/project/{project_id}/version")
                 versions_response.raise_for_status()
                 all_versions = versions_response.json()
+                members: list[Any] = []
+                try:
+                    members_response = await client.get(f"{MODRINTH_BASE}/project/{project_id}/members")
+                    if members_response.is_success:
+                        member_payload = members_response.json()
+                        if isinstance(member_payload, list):
+                            members = member_payload
+                except (httpx.HTTPError, ValueError):
+                    # Creator links are optional; a team endpoint failure should not block catalog use.
+                    members = []
             total = len(all_versions)
             page = all_versions[offset:offset + 50]
             return {"project_id": project_id, "slug": project.get("slug", ""), "title": project.get("title", ""),
                 "description": project.get("body", project.get("description", "")), "icon": project.get("icon_url", ""),
                 "platform": platform, "loaders": project.get("loaders", []),
+                "authors": modrinth_author_links(members),
                 "versions": [modrinth_version_record(v, kind, game, loader) for v in page],
                 "version_offset": offset, "total_versions": total, "has_more": offset + len(page) < total}
         key = current_curseforge_api_key()
@@ -3500,6 +3571,7 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
             project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
             project_response.raise_for_status()
             project = project_response.json().get("data", {})
+            require_curseforge_distribution(project)
             desc_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/description")
             desc_response.raise_for_status()
             description = clean_description(desc_response.json().get("data", ""))
@@ -3511,6 +3583,7 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
         return {"project_id": str(project.get("id", project_id)), "slug": project.get("slug", str(project_id)),
             "title": project.get("name", ""), "description": description or project.get("summary", ""),
             "icon": (project.get("logo") or {}).get("url", ""), "platform": platform,
+            "authors": curseforge_author_links(project),
             "versions": [curseforge_version_record(v, kind, game, loader) for v in files],
             "version_offset": offset, "total_versions": total, "has_more": offset + len(files) < total,
             "website_url": (project.get("links") or {}).get("websiteUrl", "")}

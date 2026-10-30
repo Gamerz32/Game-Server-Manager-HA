@@ -4541,6 +4541,10 @@ async def upload_managed_jar(server_id: str, kind: str, payload: dict[str, Any])
     filename = re.sub(r"[^A-Za-z0-9._ -]", "_", filename).strip(" .")[:160]
     if not filename.lower().endswith(".jar") or filename in {".jar", ""}:
         raise HTTPException(status_code=422, detail="Choose a file with the .jar extension.")
+    if any(isinstance(existing, dict) and existing.get("platform") == "upload" and
+            str(existing.get("filename", "")).casefold() == filename.casefold()
+            for existing in item.get(f"{kind}s", [])):
+        raise HTTPException(status_code=409, detail=f"A {kind} named {filename} is already installed. Remove it first or rename the file.")
     encoded = payload.get("content_base64")
     if not isinstance(encoded, str) or len(encoded) > (MANAGED_JAR_MAX_BYTES * 4 // 3) + 8:
         raise HTTPException(status_code=413, detail="Mod and plugin JAR files must be 32 MB or smaller.")
@@ -4585,7 +4589,7 @@ async def upload_managed_jar(server_id: str, kind: str, payload: dict[str, Any])
             resolved_data_root = server_data_root(server_id, create=True)
             install_folder.mkdir(parents=True, exist_ok=True)
             resolved_install_folder = install_folder.resolve()
-            if resolved_install_folder.parent != resolved_data_root:
+            if resolved_install_folder.parent != resolved_data_root or resolved_install_folder.name != folder_name:
                 raise RuntimeError("Invalid managed file install directory.")
             installed_path = resolved_install_folder / stored_filename
             with installed_path.open("xb") as target:

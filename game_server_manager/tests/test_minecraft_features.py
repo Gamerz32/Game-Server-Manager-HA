@@ -418,6 +418,32 @@ class ManagedPathTests(unittest.TestCase):
                 }))
             self.assertEqual(list(outside_path.iterdir()), [])
 
+    def test_uploaded_plugin_rejects_same_level_folder_alias(self) -> None:
+        server_id = str(uuid.uuid4())
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("plugin.yml", "name: ImportedPlugin\nversion: 1.0\nmain: example.Plugin\n")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)), \
+                patch.object(main, "stop_container"):
+            server_path = Path(temp_dir) / server_id
+            data_path = server_path / "data"
+            mods_path = data_path / "mods"
+            server_path.mkdir()
+            data_path.mkdir()
+            mods_path.mkdir()
+            (data_path / "plugins").symlink_to(mods_path, target_is_directory=True)
+            main.write_json(server_path / "server.json", {
+                "id": server_id, "game_id": "minecraft", "server_type": "PAPER",
+                "desired_state": "stopped", "plugins": [],
+            })
+
+            with self.assertRaisesRegex(RuntimeError, "Invalid managed file install directory"):
+                asyncio.run(main.upload_managed_jar(server_id, "plugin", {
+                    "filename": "plugin.jar", "content_base64": encoded(archive_bytes.getvalue()),
+                }))
+            self.assertEqual(list(mods_path.iterdir()), [])
+
     def test_modpack_overrides_reject_symlinked_server_directory(self) -> None:
         server_id = str(uuid.uuid4())
         content_id = str(uuid.uuid4())
@@ -463,7 +489,7 @@ class ManagedPathTests(unittest.TestCase):
             })
 
             with self.assertRaisesRegex(RuntimeError, "Invalid modpack storage directory"):
-                asyncio.run(main.upload_local_modpack(server_id, "post", {
+                asyncio.run(main.upload_local_modpack(server_id, {
                     "filename": "local.mrpack", "content_base64": encoded(archive_bytes.getvalue()),
                 }))
             self.assertEqual(list(outside_path.iterdir()), [])

@@ -144,6 +144,21 @@ def config_path(server_id: str) -> Path:
     return server_dir(server_id) / "server.json"
 
 
+def server_data_root(server_id: str, create: bool = False) -> Path:
+    server_path = server_dir(server_id)
+    server_root = server_path.resolve()
+    servers_root = SERVERS_DIR.resolve()
+    if server_root.parent != servers_root or server_root.name != server_path.name:
+        raise RuntimeError("Invalid server data path.")
+    data_root = server_root / "data"
+    if create:
+        data_root.mkdir(parents=True, exist_ok=True)
+    resolved_data_root = data_root.resolve()
+    if resolved_data_root.parent != server_root or resolved_data_root.name != "data":
+        raise RuntimeError("Invalid server data path.")
+    return resolved_data_root
+
+
 def read_json(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -554,15 +569,22 @@ def ensure_server_network(container) -> None:
 
 def host_server_data_dir(server_id: str) -> Path:
     global HOST_DATA_SOURCE
+    try:
+        safe_server_id = str(uuid.UUID(server_id))
+    except (ValueError, TypeError, AttributeError) as err:
+        raise RuntimeError("Invalid server data path.") from err
     if HOST_DATA_SOURCE is None:
         cli = docker_client()
         if DATA_DIR == LEGACY_DATA_DIR:
             HOST_DATA_SOURCE = docker_self_data_source(cli, "/data")
         else:
             HOST_DATA_SOURCE = docker_self_data_source(cli, "/share") / "game_server_manager"
-    path = (HOST_DATA_SOURCE / "servers" / server_id / "data").resolve()
     root = (HOST_DATA_SOURCE / "servers").resolve()
-    if root not in path.parents:
+    server_root = (root / safe_server_id).resolve()
+    if not str(server_root).startswith(f"{root}{os.sep}") or server_root.parent != root or server_root.name != safe_server_id:
+        raise RuntimeError("Invalid server data path.")
+    path = (server_root / "data").resolve()
+    if not str(path).startswith(f"{server_root}{os.sep}") or path.parent != server_root:
         raise RuntimeError("Invalid server data path.")
     path.mkdir(parents=True, exist_ok=True)
     return path
@@ -3308,7 +3330,7 @@ def apply_java_content_archive(server_id: str, content_id: str, kind: str, recor
     server_root = server_dir(server_id)
     content_root = server_root / "content" / content_id
     content_root.mkdir(parents=True, exist_ok=False)
-    archive_path = content_root / record["filename"]
+    archive_path = content_root / "archive.zip"
     archive_path.write_bytes(archive)
     record["archive_path"] = archive_path.relative_to(server_root).as_posix()
     record["size"] = len(archive)
@@ -3574,7 +3596,8 @@ async def download_installed_content(server_id: str, content_id: str):
     if not record:
         raise HTTPException(status_code=404, detail="Saved content not found.")
     path = content_archive_path(server_id, record)
-    return FileResponse(path, media_type="application/zip", filename=path.name, headers={"Cache-Control": "no-store"})
+    filename = safe_content_filename(record.get("filename", path.name), str(record.get("kind", "resourcepack")))
+    return FileResponse(path, media_type="application/zip", filename=filename, headers={"Cache-Control": "no-store"})
 
 
 @app.delete("/api/servers/{server_id}/content/{content_id}")
@@ -4285,8 +4308,13 @@ async def remove_bedrock_addon(server_id: str, addon_id: str):
 
 
 def remove_uploaded_managed_files(server_id: str, entries: list[dict[str, Any]], folder_name: str) -> None:
-    data_root = (server_dir(server_id) / "data").resolve()
-    allowed_root = (data_root / folder_name).resolve()
+    if folder_name not in {"mods", "plugins"}:
+        return
+    data_root = server_data_root(server_id)
+    folder_path = data_root / folder_name
+    allowed_root = folder_path.resolve()
+    if allowed_root.parent != data_root or allowed_root.name != folder_name:
+        return
     for entry in entries:
         if entry.get("platform") != "upload":
             continue
@@ -4362,23 +4390,34 @@ def parse_local_modpack(filename: Any, archive: bytes) -> dict[str, Any]:
 
 
 def install_local_modpack_overrides(server_id: str, content_id: str, archive: bytes) -> None:
-    data_root = (server_dir(server_id) / "data").resolve()
-    staging = data_root / f".gsm-modpack-overrides-{content_id}"
     try:
+        safe_content_id = str(uuid.UUID(content_id))
+    except (ValueError, TypeError, AttributeError) as err:
+        raise RuntimeError("Invalid modpack content ID.") from err
+    data_root = server_data_root(server_id, create=True)
+    staging = data_root / f".gsm-modpack-overrides-{safe_content_id}"
+    try:
+        staging.mkdir(exist_ok=False)
+        staging_root = staging.resolve()
+        if staging_root.parent != data_root or staging_root.name != staging.name:
+            raise RuntimeError("Invalid modpack override staging directory.")
         with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
             for info in bundle.infolist():
                 path = PurePosixPath(info.filename)
                 if path.parts[:1] != ("overrides",) or len(path.parts) == 1 or info.is_dir():
                     continue
                 relative = PurePosixPath(*path.parts[1:])
+                if relative.is_absolute() or any(part in {"", ".", ".."} for part in relative.parts):
+                    raise RuntimeError("The modpack override archive contains an unsafe path.")
                 if relative.parts[0].lower() in {"world", "world_nether", "world_the_end", "server.properties", "ops.json", "whitelist.json", "banned-players.json", "banned-ips.json", "gsm-server-icon.png"}:
                     continue
-                destination = staging.joinpath(*relative.parts)
-                if staging.resolve() not in destination.resolve().parents:
+                destination = staging_root.joinpath(*relative.parts)
+                if staging_root not in destination.resolve().parents:
                     raise RuntimeError("The modpack override archive contains an unsafe path.")
                 destination.parent.mkdir(parents=True, exist_ok=True)
                 with bundle.open(info) as source, destination.open("xb") as target:
                     shutil.copyfileobj(source, target, length=1024 * 1024)
+        files_to_install: list[tuple[Path, PurePosixPath]] = []
         for source in staging.rglob("*"):
             if not source.is_file():
                 continue
@@ -4386,11 +4425,25 @@ def install_local_modpack_overrides(server_id: str, content_id: str, archive: by
             target = data_root / relative
             if target.exists() or target.is_symlink():
                 raise RuntimeError(f"Modpack override would replace existing server data at {relative.as_posix()}.")
-        for source in staging.rglob("*"):
-            if source.is_file():
-                target = data_root / source.relative_to(staging)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                source.replace(target)
+            parent = data_root
+            for part in relative.parts[:-1]:
+                parent = parent / part
+                if parent.is_symlink() or (parent.exists() and not parent.is_dir()):
+                    raise RuntimeError(f"Modpack override has an unsafe parent directory at {relative.as_posix()}.")
+            files_to_install.append((source, relative))
+        for source, relative in files_to_install:
+            parent = data_root
+            for part in relative.parts[:-1]:
+                parent = parent / part
+                if parent.is_symlink():
+                    raise RuntimeError(f"Modpack override has an unsafe parent directory at {relative.as_posix()}.")
+                parent.mkdir(exist_ok=True)
+                if parent.is_symlink() or not parent.is_dir():
+                    raise RuntimeError(f"Modpack override has an unsafe parent directory at {relative.as_posix()}.")
+            target = parent / relative.parts[-1]
+            if target.exists() or target.is_symlink():
+                raise RuntimeError(f"Modpack override would replace existing server data at {relative.as_posix()}.")
+            source.replace(target)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
 
@@ -4413,16 +4466,10 @@ async def upload_local_modpack(server_id: str, payload: dict[str, Any]):
         raise HTTPException(status_code=422, detail="The modpack upload data is invalid.") from err
     details = parse_local_modpack(payload.get("filename"), archive)
     content_id = str(uuid.uuid4())
-    pack_root = server_dir(server_id) / "data" / "gsm-modpacks" / content_id
-    pack_root.mkdir(parents=True, exist_ok=False)
-    archive_path = pack_root / details["filename"]
-    archive_path.write_bytes(archive)
     if details["platform"] == "modrinth":
         modpack = {"platform": "upload", "project_id": content_id, "title": "Local Modrinth modpack", "local_path": f"/data/gsm-modpacks/{content_id}/{details['filename']}"}
         server_type = "MODRINTH"
     else:
-        manifest_path = pack_root / "manifest.json"
-        manifest_path.write_text(json.dumps(details["manifest"], indent=2), encoding="utf-8")
         modpack = {"platform": "upload", "project_id": content_id, "title": str(details["manifest"].get("name", "Local CurseForge modpack"))[:120], "local_manifest_path": f"/data/gsm-modpacks/{content_id}/manifest.json"}
         server_type = "AUTO_CURSEFORGE"
     item.update({"server_type": server_type, "mod_loader": details["loader"], "minecraft_version": details["game_version"],
@@ -4433,6 +4480,21 @@ async def upload_local_modpack(server_id: str, payload: dict[str, Any]):
     def install_pack():
         try:
             stop_container(server_id, remove=True, timeout=120)
+            data_root = server_data_root(server_id, create=True)
+            modpacks_root = data_root / "gsm-modpacks"
+            modpacks_root.mkdir(exist_ok=True)
+            resolved_modpacks_root = modpacks_root.resolve()
+            if resolved_modpacks_root.parent != data_root or resolved_modpacks_root.name != "gsm-modpacks":
+                raise RuntimeError("Invalid modpack storage directory.")
+            pack_root = resolved_modpacks_root / content_id
+            pack_root.mkdir(exist_ok=False)
+            archive_path = pack_root / details["filename"]
+            with archive_path.open("xb") as target:
+                target.write(archive)
+            if details["platform"] == "curseforge":
+                manifest_path = pack_root / "manifest.json"
+                with manifest_path.open("x", encoding="utf-8") as target:
+                    json.dump(details["manifest"], target, indent=2)
             if details["platform"] == "curseforge":
                 install_local_modpack_overrides(server_id, content_id, archive)
             latest = read_json(config_path(server_id))
@@ -4502,23 +4564,32 @@ async def upload_managed_jar(server_id: str, kind: str, payload: dict[str, Any])
         raise HTTPException(status_code=413, detail="Mod and plugin JAR files must be 32 MB or smaller.")
     content_id = str(uuid.uuid4())
     folder_name = "mods" if kind == "mod" else "plugins"
-    install_folder = server_dir(server_id) / "data" / folder_name
-    destination = install_folder / filename
-    if destination.exists():
-        raise HTTPException(status_code=409, detail=f"A {kind} named {filename} is already installed. Remove it first or rename the file.")
+    try:
+        data_root = server_data_root(server_id)
+    except RuntimeError as err:
+        raise HTTPException(status_code=404, detail="Server not found.") from err
+    install_folder = data_root / folder_name
+    stored_filename = f"{content_id}.jar"
     item[f"{kind}s"] = list(item.get(f"{kind}s", []))
     item[f"{kind}s"].append({"platform": "upload", "project_id": content_id, "title": Path(filename).stem[:120], "filename": filename,
-        "manual_path": f"{folder_name}/{filename}"})
+        "manual_path": f"{folder_name}/{stored_filename}"})
     keep_running = item.get("desired_state") == "running"
     item["updating"] = True
     item["job_state"] = f"{kind}-upload-queued"
     write_json(config_path(server_id), item)
 
     def install_jar():
+        installed_path: Path | None = None
         try:
             stop_container(server_id, remove=True, timeout=120)
+            resolved_data_root = server_data_root(server_id, create=True)
             install_folder.mkdir(parents=True, exist_ok=True)
-            destination.write_bytes(jar_bytes)
+            resolved_install_folder = install_folder.resolve()
+            if resolved_install_folder.parent != resolved_data_root:
+                raise RuntimeError("Invalid managed file install directory.")
+            installed_path = resolved_install_folder / stored_filename
+            with installed_path.open("xb") as target:
+                target.write(jar_bytes)
             latest = read_json(config_path(server_id))
             if latest and keep_running:
                 latest["desired_state"] = "running"
@@ -4526,7 +4597,8 @@ async def upload_managed_jar(server_id: str, kind: str, payload: dict[str, Any])
                 write_json(config_path(server_id), latest)
                 run_container(server_id)
         except Exception:
-            destination.unlink(missing_ok=True)
+            if installed_path is not None:
+                installed_path.unlink(missing_ok=True)
             latest = read_json(config_path(server_id))
             if latest:
                 latest[f"{kind}s"] = [entry for entry in latest.get(f"{kind}s", []) if entry.get("project_id") != content_id]
@@ -4983,5 +5055,6 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
         raise HTTPException(status_code=502, detail=f"{platform.title()} returned HTTP {err.response.status_code}.")
     except httpx.HTTPError as err:
         raise HTTPException(status_code=502, detail=f"Could not reach {platform.title()}: {err}")
+
 
 

@@ -342,5 +342,133 @@ class HangarCatalogTests(unittest.TestCase):
         self.assertEqual(main.hangar_direct_download_url("http://hangarcdn.papermc.io/plugin.jar"), "")
 
 
+class ManagedPathTests(unittest.TestCase):
+    def test_host_server_data_path_uses_canonical_uuid(self) -> None:
+        server_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "HOST_DATA_SOURCE", Path(temp_dir)):
+            data_path = main.host_server_data_dir(f"{{{server_id.upper()}}}")
+            self.assertEqual(data_path, Path(temp_dir) / "servers" / server_id / "data")
+
+            outside_name = f"outside-{server_id}"
+            with self.assertRaisesRegex(RuntimeError, "Invalid server data path"):
+                main.host_server_data_dir(f"../../{outside_name}")
+            self.assertFalse((Path(temp_dir).parent / outside_name).exists())
+
+    def test_installed_content_archive_uses_fixed_storage_name(self) -> None:
+        server_id = str(uuid.uuid4())
+        content_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)):
+            record = {"id": content_id, "kind": "resourcepack", "filename": "creator-pack.zip"}
+            main.apply_java_content_archive(server_id, content_id, "resourcepack", record, b"zip-data", "")
+
+            archive_path = main.content_archive_path(server_id, record)
+            self.assertEqual(archive_path.name, "archive.zip")
+            self.assertEqual(archive_path.read_bytes(), b"zip-data")
+            self.assertEqual(record["filename"], "creator-pack.zip")
+
+    def test_uploaded_plugin_uses_generated_disk_filename(self) -> None:
+        server_id = str(uuid.uuid4())
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("plugin.yml", "name: ImportedPlugin\nversion: 1.0\nmain: example.Plugin\n")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)), \
+                patch.object(main, "stop_container"), patch.object(main, "current_status", return_value=("stopped", None)):
+            server_path = Path(temp_dir) / server_id
+            server_path.mkdir()
+            main.write_json(server_path / "server.json", {
+                "id": server_id, "game_id": "minecraft", "server_type": "PAPER",
+                "desired_state": "stopped", "plugins": [],
+            })
+            response = asyncio.run(main.upload_managed_jar(server_id, "plugin", {
+                "filename": "../outside.jar", "content_base64": encoded(archive_bytes.getvalue()),
+            }))
+
+            plugin = response["server"]["plugins"][0]
+            self.assertEqual(plugin["filename"], "outside.jar")
+            self.assertEqual(plugin["title"], "outside")
+            self.assertRegex(plugin["manual_path"], r"^plugins/[0-9a-f-]+\.jar$")
+            installed_path = server_path / "data" / plugin["manual_path"]
+            self.assertEqual(installed_path.read_bytes(), archive_bytes.getvalue())
+            self.assertFalse((Path(temp_dir) / "outside.jar").exists())
+
+    def test_uploaded_plugin_rejects_symlinked_install_folder(self) -> None:
+        server_id = str(uuid.uuid4())
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("plugin.yml", "name: ImportedPlugin\nversion: 1.0\nmain: example.Plugin\n")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)), \
+                patch.object(main, "stop_container"):
+            server_path = Path(temp_dir) / server_id
+            data_path = server_path / "data"
+            outside_path = Path(temp_dir) / "outside"
+            server_path.mkdir()
+            data_path.mkdir()
+            outside_path.mkdir()
+            (data_path / "plugins").symlink_to(outside_path, target_is_directory=True)
+            main.write_json(server_path / "server.json", {
+                "id": server_id, "game_id": "minecraft", "server_type": "PAPER",
+                "desired_state": "stopped", "plugins": [],
+            })
+
+            with self.assertRaisesRegex(RuntimeError, "Invalid managed file install directory"):
+                asyncio.run(main.upload_managed_jar(server_id, "plugin", {
+                    "filename": "plugin.jar", "content_base64": encoded(archive_bytes.getvalue()),
+                }))
+            self.assertEqual(list(outside_path.iterdir()), [])
+
+    def test_modpack_overrides_reject_symlinked_server_directory(self) -> None:
+        server_id = str(uuid.uuid4())
+        content_id = str(uuid.uuid4())
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("overrides/plugins/unexpected.jar", b"plugin data")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)):
+            server_path = Path(temp_dir) / server_id
+            data_path = server_path / "data"
+            outside_path = Path(temp_dir) / "outside"
+            server_path.mkdir()
+            data_path.mkdir()
+            outside_path.mkdir()
+            (data_path / "plugins").symlink_to(outside_path, target_is_directory=True)
+
+            with self.assertRaisesRegex(RuntimeError, "unsafe parent directory"):
+                main.install_local_modpack_overrides(server_id, content_id, archive_bytes.getvalue())
+            self.assertEqual(list(outside_path.iterdir()), [])
+
+    def test_local_modpack_upload_rejects_symlinked_modpack_directory(self) -> None:
+        server_id = str(uuid.uuid4())
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("modrinth.index.json", json.dumps({
+                "formatVersion": 1,
+                "game": "minecraft",
+                "dependencies": {"minecraft": "1.20.1", "fabric-loader": "0.15.0"},
+            }))
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)), \
+                patch.object(main, "stop_container"):
+            server_path = Path(temp_dir) / server_id
+            data_path = server_path / "data"
+            outside_path = Path(temp_dir) / "outside"
+            server_path.mkdir()
+            data_path.mkdir()
+            outside_path.mkdir()
+            (data_path / "gsm-modpacks").symlink_to(outside_path, target_is_directory=True)
+            main.write_json(server_path / "server.json", {
+                "id": server_id, "game_id": "minecraft", "server_type": "VANILLA",
+                "desired_state": "stopped", "mods": [], "plugins": [],
+            })
+
+            with self.assertRaisesRegex(RuntimeError, "Invalid modpack storage directory"):
+                asyncio.run(main.upload_local_modpack(server_id, "post", {
+                    "filename": "local.mrpack", "content_base64": encoded(archive_bytes.getvalue()),
+                }))
+            self.assertEqual(list(outside_path.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()
+

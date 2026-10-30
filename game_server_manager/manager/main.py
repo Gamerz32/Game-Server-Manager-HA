@@ -37,10 +37,13 @@ from manager.games.minecraft import MINECRAFT_DRIVER
 
 logging.basicConfig(level=logging.INFO, format="[%(levelname)s] %(message)s")
 LOG = logging.getLogger("game-server-manager")
-DATA_DIR = Path("/data")
+SHARE_DIR = Path("/share")
+SHARE_DATA_DIR = SHARE_DIR / "game_server_manager"
+LEGACY_DATA_DIR = Path("/data")
+DATA_DIR = SHARE_DATA_DIR
 SERVERS_DIR = DATA_DIR / "servers"
 SETTINGS_FILE = DATA_DIR / "manager-settings.json"
-OPTIONS_FILE = DATA_DIR / "options.json"
+OPTIONS_FILE = LEGACY_DATA_DIR / "options.json"
 STATIC_DIR = Path(__file__).parent / "static"
 DOCKER_SOCKET = "unix:///run/docker.sock"
 MANAGER_LABEL = "io.gamerz32.game-server-manager"
@@ -52,6 +55,7 @@ SERVER_TYPES = set(MINECRAFT_DRIVER.server_types)
 CF_CLASS_IDS = {"modpack": 4471, "mod": 6, "plugin": 5}
 MODRINTH_BASE = "https://api.modrinth.com/v2"
 CURSEFORGE_BASE = "https://api.curseforge.com/v1"
+HANGAR_BASE = "https://hangar.papermc.io/api/v1"
 JAVA_TAGS = {"auto": "latest", "8": "java8", "17": "java17", "21": "java21", "25": "java25"}
 UPDATE_CHECK_INTERVAL = 4 * 60 * 60
 MAINTENANCE_INTERVAL = 60
@@ -91,6 +95,8 @@ DOCKER_CLIENT: docker.DockerClient | None = None
 DOCKER_CLIENT_LOCK = threading.Lock()
 SERVER_LOCKS: dict[str, threading.Lock] = {}
 SERVER_LOCKS_LOCK = threading.Lock()
+SERVER_CONTAINER_LOCKS: dict[str, threading.Lock] = {}
+SERVER_CONTAINER_LOCKS_LOCK = threading.Lock()
 SHUTTING_DOWN = False
 CURSEFORGE_API_KEY = ""
 DOCKER_UNAVAILABLE_MESSAGE = "Docker Engine is unavailable. Check the add-on logs for details."
@@ -109,6 +115,13 @@ def server_lock(server_id: str) -> threading.Lock:
         if server_id not in SERVER_LOCKS:
             SERVER_LOCKS[server_id] = threading.Lock()
         return SERVER_LOCKS[server_id]
+
+
+def server_container_lock(server_id: str) -> threading.Lock:
+    with SERVER_CONTAINER_LOCKS_LOCK:
+        if server_id not in SERVER_CONTAINER_LOCKS:
+            SERVER_CONTAINER_LOCKS[server_id] = threading.Lock()
+        return SERVER_CONTAINER_LOCKS[server_id]
 
 
 def server_dir(server_id: str) -> Path:
@@ -155,6 +168,8 @@ def read_json(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, A
             value.setdefault("members", [])
             value.setdefault("visitors", [])
             value.setdefault("bedrock_addons", [])
+            value.setdefault("control_generation", 0)
+            value.setdefault("force_stopped", False)
             value.setdefault("access_lists_applied", {"whitelist_enabled": False, "whitelist_players": [], "blacklist_players": [], "operators": [], "members": [], "visitors": []})
         return value
     except (OSError, json.JSONDecodeError):
@@ -162,6 +177,25 @@ def read_json(path: Path, fallback: dict[str, Any] | None = None) -> dict[str, A
 
 
 def write_json(path: Path, value: dict[str, Any], secret: bool = False) -> None:
+    # A force-exit or explicit start advances this generation. A background job
+    # that read the old config before that request must not overwrite its newer
+    # desired state when it eventually finishes.
+    if path.name == "server.json" and path.exists():
+        try:
+            current = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(current, dict):
+                current_generation = int(current.get("control_generation", 0))
+                next_generation = int(value.get("control_generation", 0))
+                if current_generation > next_generation:
+                    value["control_generation"] = current_generation
+                    for key in (
+                        "force_stopped", "desired_state", "job_state", "updating",
+                        "world_resetting", "deleting", "auto_stopped", "auto_paused",
+                    ):
+                        if key in current:
+                            value[key] = current[key]
+        except (OSError, TypeError, ValueError, json.JSONDecodeError):
+            pass
     path.parent.mkdir(parents=True, exist_ok=True)
     temp_path = path.with_suffix(path.suffix + ".tmp")
     temp_path.write_text(json.dumps(value, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
@@ -283,12 +317,191 @@ def docker_self_container(client: docker.DockerClient):
     return own
 
 
-def docker_self_data_source(client: docker.DockerClient) -> Path:
+def set_data_root(path: Path) -> None:
+    global DATA_DIR, SERVERS_DIR, SETTINGS_FILE
+    DATA_DIR = path
+    SERVERS_DIR = DATA_DIR / "servers"
+    SETTINGS_FILE = DATA_DIR / "manager-settings.json"
+
+
+def _storage_entries(path: Path) -> list[Path]:
+    if not path.is_dir():
+        return []
+    # Home Assistant owns options.json and rewrites it on every app start.
+    return sorted((child for child in path.iterdir() if child.name != "options.json"), key=lambda child: child.name)
+
+
+def _entry_signature(path: Path) -> tuple[tuple[Any, ...], ...]:
+    """Describe an entry without following links so interrupted copies can be resumed safely."""
+    result: list[tuple[Any, ...]] = []
+
+    def visit(current: Path, relative: str) -> None:
+        info = current.lstat()
+        mode = stat.S_IMODE(info.st_mode)
+        if stat.S_ISLNK(info.st_mode):
+            result.append((relative, "link", os.readlink(current), info.st_uid, info.st_gid, mode))
+        elif stat.S_ISDIR(info.st_mode):
+            result.append((relative, "dir", info.st_uid, info.st_gid, mode))
+            for child in sorted(current.iterdir(), key=lambda item: item.name):
+                child_relative = f"{relative}/{child.name}" if relative else child.name
+                visit(child, child_relative)
+        elif stat.S_ISREG(info.st_mode):
+            result.append((relative, "file", info.st_size, info.st_uid, info.st_gid, mode))
+        else:
+            raise RuntimeError(f"Unsupported special file in app data: {current}")
+
+    visit(path, "")
+    return tuple(result)
+
+
+def _chown_like(source: Path, destination: Path) -> None:
+    info = source.lstat()
+    os.chown(destination, info.st_uid, info.st_gid, follow_symlinks=False)
+
+
+def _copy_file_preserving_owner(source: str, destination: str) -> str:
+    source_path = Path(source)
+    destination_path = Path(destination)
+    shutil.copy2(source_path, destination_path)
+    _chown_like(source_path, destination_path)
+    return destination
+
+
+def _copy_storage_entry(source: Path, destination: Path) -> None:
+    info = source.lstat()
+    if stat.S_ISLNK(info.st_mode):
+        os.symlink(os.readlink(source), destination)
+        _chown_like(source, destination)
+    elif stat.S_ISDIR(info.st_mode):
+        shutil.copytree(source, destination, symlinks=True, copy_function=_copy_file_preserving_owner)
+        for current, directories, files in os.walk(destination, topdown=False, followlinks=False):
+            for name in directories + files:
+                copied = Path(current) / name
+                original = source / copied.relative_to(destination)
+                _chown_like(original, copied)
+        _chown_like(source, destination)
+    elif stat.S_ISREG(info.st_mode):
+        shutil.copy2(source, destination)
+        _chown_like(source, destination)
+    else:
+        raise RuntimeError(f"Unsupported special file in app data: {source}")
+
+
+def _remove_storage_entry(path: Path) -> None:
+    if path.is_symlink() or not path.is_dir():
+        path.unlink(missing_ok=True)
+    else:
+        shutil.rmtree(path)
+
+
+def _stop_managed_containers_for_storage_move(client: docker.DockerClient) -> None:
+    for container in client.containers.list(all=True):
+        container.reload()
+        labels = container.attrs.get("Config", {}).get("Labels") or {}
+        generic_server = labels.get(MANAGER_LABEL) == "true" and labels.get(f"{MANAGER_LABEL}.server_id")
+        legacy_server = (
+            labels.get(LEGACY_MINECRAFT_MANAGER_LABEL) == "true"
+            and labels.get(f"{LEGACY_MINECRAFT_MANAGER_LABEL}.server_id")
+            and labels.get(GATEWAY_LABEL) != "true"
+        )
+        if not (generic_server or legacy_server):
+            continue
+        if container.status == "paused":
+            container.unpause()
+            container.reload()
+        if container.status in {"running", "restarting"}:
+            container.stop(timeout=120)
+            container.reload()
+        if container.status in {"running", "restarting", "paused"}:
+            raise RuntimeError(f"Could not stop managed game container {container.name} before moving its data.")
+
+
+def migrate_private_data_to_share(client: docker.DockerClient) -> bool:
+    """Move app-owned files from private /data into the shared Home Assistant folder."""
+    if SHARE_DATA_DIR.is_symlink():
+        raise RuntimeError("The /share/game_server_manager storage folder must not be a symbolic link.")
+    SHARE_DATA_DIR.mkdir(parents=True, exist_ok=True)
+    if SHARE_DIR.resolve() not in SHARE_DATA_DIR.resolve().parents:
+        raise RuntimeError("The game server storage folder must remain inside /share.")
+    source_entries = _storage_entries(LEGACY_DATA_DIR)
+    if not source_entries:
+        set_data_root(SHARE_DATA_DIR)
+        return True
+
+    # Reconcile a prior interrupted copy only when the source and public copy match.
+    pending: list[tuple[Path, Path]] = []
+    for source in source_entries:
+        destination = SHARE_DATA_DIR / source.name
+        if destination.exists() or destination.is_symlink():
+            if _entry_signature(source) != _entry_signature(destination):
+                LOG.error("Cannot migrate app data: %s already exists in /share and differs from /data.", destination)
+                set_data_root(LEGACY_DATA_DIR)
+                return False
+        else:
+            pending.append((source, destination))
+
+    if source_entries:
+        _stop_managed_containers_for_storage_move(client)
+
+    try:
+        same_filesystem = os.stat(LEGACY_DATA_DIR).st_dev == os.stat(SHARE_DATA_DIR).st_dev
+    except OSError:
+        same_filesystem = False
+
+    if same_filesystem:
+        moved: list[tuple[Path, Path]] = []
+        try:
+            for source, destination in pending:
+                os.replace(source, destination)
+                moved.append((source, destination))
+        except OSError:
+            # A mount nested under /data can still cross devices. Undo earlier renames,
+            # then use the staged copy path for the whole migration.
+            for source, destination in reversed(moved):
+                os.replace(destination, source)
+            same_filesystem = False
+
+    if not same_filesystem:
+        staging = SHARE_DATA_DIR / f".gsm-storage-migration-{uuid.uuid4().hex}"
+        staging.mkdir()
+        published: list[Path] = []
+        try:
+            staged: list[tuple[Path, Path]] = []
+            for source, destination in pending:
+                temporary = staging / source.name
+                _copy_storage_entry(source, temporary)
+                if _entry_signature(source) != _entry_signature(temporary):
+                    raise RuntimeError(f"App data copy verification failed for {source}.")
+                staged.append((temporary, destination))
+            for temporary, destination in staged:
+                os.replace(temporary, destination)
+                published.append(destination)
+        except Exception:
+            for destination in reversed(published):
+                _remove_storage_entry(destination)
+            shutil.rmtree(staging, ignore_errors=True)
+            raise
+        shutil.rmtree(staging, ignore_errors=True)
+
+    # All destination entries now exist and have been moved or verified. Remove any
+    # matching source copies left by an interrupted earlier attempt or cross-device copy.
+    for source in source_entries:
+        if source.exists() or source.is_symlink():
+            try:
+                _remove_storage_entry(source)
+            except OSError:
+                LOG.warning("Copied %s into /share but could not remove the old private copy.", source)
+
+    set_data_root(SHARE_DATA_DIR)
+    LOG.info("Moved existing server and manager files into /share/game_server_manager.")
+    return True
+
+def docker_self_data_source(client: docker.DockerClient, destination: str = "/share") -> Path:
     own = docker_self_container(client)
     for mount in own.attrs.get("Mounts", []):
-        if mount.get("Destination") == "/data" and mount.get("Source"):
+        if mount.get("Destination") == destination and mount.get("Source"):
             return Path(mount["Source"])
-    raise RuntimeError("Home Assistant's persistent /data mount was not found in the Docker container details.")
+    raise RuntimeError(f"Home Assistant's persistent {destination} mount was not found in the Docker container details.")
 
 
 def ensure_minecraft_network(client: docker.DockerClient):
@@ -335,7 +548,10 @@ def host_server_data_dir(server_id: str) -> Path:
     global HOST_DATA_SOURCE
     if HOST_DATA_SOURCE is None:
         cli = docker_client()
-        HOST_DATA_SOURCE = docker_self_data_source(cli)
+        if DATA_DIR == LEGACY_DATA_DIR:
+            HOST_DATA_SOURCE = docker_self_data_source(cli, "/data")
+        else:
+            HOST_DATA_SOURCE = docker_self_data_source(cli, "/share") / "game_server_manager"
     path = (HOST_DATA_SOURCE / "servers" / server_id / "data").resolve()
     root = (HOST_DATA_SOURCE / "servers").resolve()
     if root not in path.parents:
@@ -354,7 +570,7 @@ def import_legacy_server() -> None:
     server_id = str(uuid.uuid4())
     destination = server_dir(server_id) / "data"
     shutil.copytree(legacy, destination, dirs_exist_ok=True, symlinks=False)
-    old_options = read_json(DATA_DIR / "options.json")
+    old_options = read_json(OPTIONS_FILE)
     try:
         min_ram = int(old_options.get("xms_mb", 1024))
         max_ram = int(old_options.get("xmx_mb", 4096))
@@ -382,7 +598,7 @@ def import_legacy_server() -> None:
         "imported_from": "/share/minecraft-vanilla",
     }
     write_json(config_path(server_id), item)
-    LOG.info("Imported the previous vanilla server to /data; its original /share copy was kept intact.")
+    LOG.info("Imported the previous vanilla server into /share/game_server_manager; its original copy was kept intact.")
 
 
 def get_container(server_id: str):
@@ -999,78 +1215,141 @@ def run_container(server_id: str) -> None:
     if not item:
         raise RuntimeError("Server configuration was not found.")
     cli = docker_client()
-    try:
-        existing = get_container(server_id)
-        if existing.status == "running":
-            return
-        existing.remove(force=True)
-    except NotFound:
-        pass
     driver = game_driver_for(item)
     image = driver.image_for(item)
-    item["job_state"] = "pulling"
-    write_json(config_path(server_id), item)
+
+    with server_container_lock(server_id):
+        item = read_json(config_path(server_id))
+        if not item:
+            raise RuntimeError("Server configuration was not found.")
+        if item.get("force_stopped") or item.get("desired_state") != "running":
+            item["desired_state"] = "stopped"
+            item["job_state"] = "force-stopped" if item.get("force_stopped") else "stopped"
+            write_json(config_path(server_id), item)
+            return
+        try:
+            existing = get_container(server_id)
+            if existing.status == "running":
+                return
+            existing.remove(force=True)
+        except NotFound:
+            pass
+        item["job_state"] = "pulling"
+        write_json(config_path(server_id), item)
+
+    # Image pulls can take a long time. Leave the container action lock free so
+    # Force exit can return immediately; the second check below prevents this
+    # older job from creating a container after the force-exit request.
     try:
         cli.images.get(image)
     except ImageNotFound:
         cli.images.pull(image)
     if SHUTTING_DOWN:
         return
-    item["job_state"] = "starting"
-    write_json(config_path(server_id), item)
-    data_source = host_server_data_dir(server_id)
-    driver = game_driver_for(item)
-    labels = {
-        MANAGER_LABEL: "true",
-        f"{MANAGER_LABEL}.server_id": server_id,
-        f"{MANAGER_LABEL}.game_id": driver.game_id,
-    }
-    if driver.legacy_manager_label:
-        labels[driver.legacy_manager_label] = "true"
-        labels[f"{driver.legacy_manager_label}.server_id"] = server_id
-    create_options: dict[str, Any] = {
-        "image": image,
-        "name": driver.container_name(server_id),
-        "labels": labels,
-        "environment": driver.environment_for(item, settings()),
-        "volumes": {str(data_source): {"bind": "/data", "mode": "rw"}},
-        "restart_policy": {"Name": "unless-stopped"},
-        "tty": True,
-        "stdin_open": True,
-    }
-    if driver.game_id == "minecraft_bedrock":
-        create_options["mem_limit"] = int(item.get("max_ram_mb", 4096)) * 1024 * 1024
-    if driver.container_network:
-        create_options["network"] = driver.container_network
-    port_bindings = driver.container_port_bindings(item)
-    if port_bindings:
-        create_options["ports"] = port_bindings
-    container = cli.containers.create(**create_options)
-    try:
-        container.start()
-    except Exception:
+
+    with server_container_lock(server_id):
+        item = read_json(config_path(server_id))
+        if not item:
+            raise RuntimeError("Server configuration was not found.")
+        if item.get("force_stopped") or item.get("desired_state") != "running":
+            item["desired_state"] = "stopped"
+            item["job_state"] = "force-stopped" if item.get("force_stopped") else "stopped"
+            write_json(config_path(server_id), item)
+            return
         try:
-            container.remove(force=True)
-        except DockerException:
+            existing = get_container(server_id)
+            if existing.status == "running":
+                return
+            existing.remove(force=True)
+        except NotFound:
             pass
-        raise
-    item["job_state"] = "running"
-    item["desired_state"] = "running"
-    write_json(config_path(server_id), item)
+        item["job_state"] = "starting"
+        write_json(config_path(server_id), item)
+        data_source = host_server_data_dir(server_id)
+        driver = game_driver_for(item)
+        labels = {
+            MANAGER_LABEL: "true",
+            f"{MANAGER_LABEL}.server_id": server_id,
+            f"{MANAGER_LABEL}.game_id": driver.game_id,
+        }
+        if driver.legacy_manager_label:
+            labels[driver.legacy_manager_label] = "true"
+            labels[f"{driver.legacy_manager_label}.server_id"] = server_id
+        create_options: dict[str, Any] = {
+            "image": image,
+            "name": driver.container_name(server_id),
+            "labels": labels,
+            "environment": driver.environment_for(item, settings()),
+            "volumes": {str(data_source): {"bind": "/data", "mode": "rw"}},
+            "restart_policy": {"Name": "unless-stopped"},
+            "tty": True,
+            "stdin_open": True,
+        }
+        if driver.game_id == "minecraft_bedrock":
+            create_options["mem_limit"] = int(item.get("max_ram_mb", 4096)) * 1024 * 1024
+        if driver.container_network:
+            create_options["network"] = driver.container_network
+        port_bindings = driver.container_port_bindings(item)
+        if port_bindings:
+            create_options["ports"] = port_bindings
+        container = cli.containers.create(**create_options)
+        try:
+            container.start()
+        except Exception:
+            try:
+                container.remove(force=True)
+            except DockerException:
+                pass
+            raise
+        item["job_state"] = "running"
+        item["desired_state"] = "running"
+        write_json(config_path(server_id), item)
     threading.Thread(target=sync_server_access, args=(server_id,), name=f"access-sync-{server_id[:8]}", daemon=True).start()
 
 
-def stop_container(server_id: str, remove: bool = False, timeout: int = 120) -> None:
+def stop_container(server_id: str, remove: bool = False, timeout: int = 120, force: bool = False) -> None:
+    if force:
+        # Serialize a force exit with container creation/start, but let it cut
+        # through a normal stop that may be waiting on Docker's restart backoff.
+        with server_container_lock(server_id):
+            _stop_container(server_id, remove=remove, timeout=timeout, force=True)
+        return
+    else:
+        # Ordinary stops can wait through Docker's restart delay. Do not hold
+        # the start lock here: Force exit must be able to interrupt that wait.
+        _stop_container(server_id, remove=remove, timeout=timeout, force=force)
+
+
+def _stop_container(server_id: str, remove: bool = False, timeout: int = 120, force: bool = False) -> None:
     try:
         container = get_container(server_id)
     except NotFound:
         return
 
-    # Docker can report "restarting" while a child container is in its restart
-    # backoff. Wait for it to reach a stoppable state instead of issuing a
-    # non-forced remove, which Docker rejects with HTTP 409.
+    if force:
+        # A forced exit removes only the container. Server files live in a bind
+        # mount, so they remain intact for a later Start, reset, or delete.
+        # Removing the container also avoids waiting for Docker's restart backoff.
+        try:
+            container.update(restart_policy={"Name": "no"})
+        except APIError as err:
+            if err.status_code == 404:
+                return
+            if err.status_code not in {304, 409}:
+                LOG.warning("Could not disable restart policy before force-removing server %s: %s", server_id, err)
+        try:
+            container.remove(force=True, v=False)
+        except NotFound:
+            return
+        except APIError as err:
+            if err.status_code == 404:
+                return
+            raise RuntimeError(f"Docker could not force-remove server container {server_id}: {err}") from err
+        return
+
     deadline = time.monotonic() + max(timeout, 10) + 65
     last_conflict = ""
+
     while True:
         try:
             container.reload()
@@ -1082,6 +1361,8 @@ def stop_container(server_id: str, remove: bool = False, timeout: int = 120) -> 
             try:
                 container.unpause()
             except APIError as err:
+                if err.status_code == 404:
+                    return
                 if err.status_code not in {304, 409}:
                     raise
                 last_conflict = str(err)
@@ -1094,6 +1375,8 @@ def stop_container(server_id: str, remove: bool = False, timeout: int = 120) -> 
             try:
                 container.stop(timeout=timeout)
             except APIError as err:
+                if err.status_code == 404:
+                    return
                 if err.status_code not in {304, 409}:
                     raise
                 last_conflict = str(err)
@@ -1123,7 +1406,7 @@ def stop_container(server_id: str, remove: bool = False, timeout: int = 120) -> 
                         raise RuntimeError(f"Timed out removing server container {server_id}: {last_conflict}") from err
                     time.sleep(0.25)
                     continue
-            elif status == "exited":
+            elif status == "exited" and not force:
                 # If the server crashed before this stop request, disable its
                 # pending restart. ensure_running restores this policy on start.
                 try:
@@ -1144,53 +1427,108 @@ def stop_container(server_id: str, remove: bool = False, timeout: int = 120) -> 
         time.sleep(0.25)
 
 
+def cancel_server_jobs(server_id: str, reason: str = "Cancelled by force exit") -> None:
+    with JOBS_LOCK:
+        for job in JOBS.values():
+            if job.get("server_id") != server_id or job.get("state") in {"complete", "failed", "cancelled"}:
+                continue
+            job["cancel_requested"] = True
+            if job.get("state") == "queued":
+                job["state"] = "cancelled"
+                job["message"] = reason
+            else:
+                job["message"] = "Force exit requested; restart actions are disabled."
+
+
 def submit_job(server_id: str, operation: str, fn) -> str:
     job_id = str(uuid.uuid4())
-    job = {"id": job_id, "server_id": server_id, "operation": operation, "state": "queued", "message": "Queued", "created_at": __import__("datetime").datetime.now().isoformat()}
+    job = {"id": job_id, "server_id": server_id, "operation": operation, "state": "queued", "executing": False, "message": "Queued", "created_at": __import__("datetime").datetime.now().isoformat()}
     with JOBS_LOCK:
         JOBS[job_id] = job
 
     def run():
         with JOBS_LOCK:
+            if JOBS[job_id].get("cancel_requested"):
+                JOBS[job_id]["state"] = "cancelled"
+                JOBS[job_id]["message"] = "Cancelled before it started."
+                return
             JOBS[job_id]["state"] = "running"
             JOBS[job_id]["message"] = "Working"
         try:
             with server_lock(server_id):
+                with JOBS_LOCK:
+                    if JOBS[job_id].get("cancel_requested"):
+                        JOBS[job_id]["state"] = "cancelled"
+                        JOBS[job_id]["message"] = "Cancelled before it started."
+                        return
+                    JOBS[job_id]["executing"] = True
                 fn()
             with JOBS_LOCK:
-                JOBS[job_id]["state"] = "complete"
-                JOBS[job_id]["message"] = "Complete"
+                JOBS[job_id]["state"] = "cancelled" if JOBS[job_id].get("cancel_requested") else "complete"
+                JOBS[job_id]["message"] = "Cancelled by force exit." if JOBS[job_id].get("cancel_requested") else "Complete"
         except Exception as err:
             LOG.exception("Server %s job failed", server_id)
             with JOBS_LOCK:
-                JOBS[job_id]["state"] = "failed"
-                JOBS[job_id]["message"] = str(err)[:500]
+                cancelled = JOBS[job_id].get("cancel_requested")
+                JOBS[job_id]["state"] = "cancelled" if cancelled else "failed"
+                JOBS[job_id]["message"] = "Cancelled by force exit." if cancelled else str(err)[:500]
 
     POOL.submit(run)
     return job_id
 
 
 def ensure_running(server_id: str) -> None:
+    item = read_json(config_path(server_id))
+    if item.get("force_stopped") or item.get("desired_state") != "running":
+        return
     status, container = current_status(server_id)
+    if container is not None:
+        expected_source = host_server_data_dir(server_id).resolve()
+        actual_source = next(
+            (
+                Path(mount["Source"]).resolve()
+                for mount in container.attrs.get("Mounts", [])
+                if mount.get("Destination") == "/data" and mount.get("Source")
+            ),
+            None,
+        )
+        if actual_source != expected_source:
+            # Existing servers were created before the switch from private /data to
+            # /share/game_server_manager. Recreate only the container; its world remains mounted
+            # from the newly migrated host directory.
+            stop_container(server_id, remove=True)
+            status, container = "stopped", None
     if status in {"running", "restarting"}:
         return
     if container is not None and status == "paused":
-        container.unpause()
-        item = read_json(config_path(server_id))
-        item["desired_state"] = "running"
-        item["job_state"] = "running"
-        item["auto_paused"] = False
-        write_json(config_path(server_id), item)
+        with server_container_lock(server_id):
+            item = read_json(config_path(server_id))
+            if item.get("force_stopped") or item.get("desired_state") != "running":
+                return
+            container.reload()
+            if container.status == "paused":
+                container.unpause()
+            item = read_json(config_path(server_id))
+            item["desired_state"] = "running"
+            item["job_state"] = "running"
+            item["auto_paused"] = False
+            write_json(config_path(server_id), item)
         return
     if container is not None and status == "exited":
-        container.update(restart_policy={"Name": "unless-stopped"})
-        container.start()
-        item = read_json(config_path(server_id))
-        item["desired_state"] = "running"
-        item["job_state"] = "running"
-        item["auto_stopped"] = False
-        item["auto_paused"] = False
-        write_json(config_path(server_id), item)
+        with server_container_lock(server_id):
+            item = read_json(config_path(server_id))
+            if item.get("force_stopped") or item.get("desired_state") != "running":
+                return
+            container.reload()
+            if container.status == "exited":
+                container.update(restart_policy={"Name": "unless-stopped"})
+                container.start()
+            item = read_json(config_path(server_id))
+            item["desired_state"] = "running"
+            item["job_state"] = "running"
+            item["auto_stopped"] = False
+            item["auto_paused"] = False
+            write_json(config_path(server_id), item)
         return
     run_container(server_id)
 
@@ -1385,7 +1723,7 @@ async def handle_minecraft_connection(server_id: str, reader: asyncio.StreamRead
                 return
             status, _ = current_status(server_id)
         elif status in {"stopped", "exited", "created"} and item.get("wake_on_join", True):
-            should_wake = item.get("auto_stopped") or item.get("desired_state") == "running"
+            should_wake = not item.get("force_stopped") and (item.get("auto_stopped") or item.get("desired_state") == "running")
             if should_wake:
                 item["desired_state"] = "running"
                 item["auto_stopped"] = False
@@ -1791,7 +2129,7 @@ def provider_update(item: dict[str, Any], platform: str, project_id: str, curren
                     return {"kind": kind, "platform": platform, "project_id": project_id,
                         "version_id": latest_id, "name": str(version.get("name") or version.get("version_number") or "New version")}
                 break
-        else:
+        elif platform == "curseforge":
             api_key = current_curseforge_api_key()
             if not project_id.isdigit():
                 return None
@@ -1816,6 +2154,30 @@ def provider_update(item: dict[str, Any], platform: str, project_id: str, curren
                 if latest_id and latest_id != current_id:
                     return {"kind": kind, "platform": platform, "project_id": project_id,
                         "file_id": latest_id, "name": str(version.get("displayName") or version.get("fileName") or "New version")}
+                break
+        elif platform == "hangar" and kind == "plugin" and project_id.isdigit():
+            response = httpx.get(
+                f"{HANGAR_BASE}/projects/{project_id}/versions",
+                params={"limit": 50, "offset": 0, "platform": "PAPER"},
+                timeout=15,
+                headers={"Accept": "application/json"},
+            )
+            response.raise_for_status()
+            versions = response.json().get("result") or []
+            game = str(item.get("minecraft_version", "")).strip()
+            if game.upper() in {"", "LATEST", "SNAPSHOT"}:
+                return None
+            for version in versions:
+                if not isinstance(version, dict) or version.get("visibility") != "public":
+                    continue
+                record = hangar_version_record(version, game)
+                latest_id = record["id"]
+                if not record["compatible"] or not record["installable"]:
+                    continue
+                if latest_id and latest_id != current_id:
+                    return {"kind": kind, "platform": platform, "project_id": project_id,
+                        "version_id": latest_id, "download_url": record["download_url"],
+                        "name": record["number"] or "New version"}
                 break
     except (httpx.HTTPError, ValueError, TypeError) as err:
         LOG.warning("Could not check %s updates for project %s: %s", platform, project_id, err)
@@ -1991,11 +2353,15 @@ def apply_server_updates(server_id: str, force: bool = False) -> None:
                             project["version_id"] = update["version_id"]
                         if update.get("file_id"):
                             project["file_id"] = update["file_id"]
+                        if update.get("download_url") and project.get("platform") == "hangar":
+                            project["download_url"] = hangar_direct_download_url(update["download_url"])
         write_json(config_path(server_id), item)
         stop_container(server_id, remove=True, timeout=120)
         image = game_driver_for(item).image_for(item)
         docker_client().images.pull(image)
-        if was_running:
+        latest = read_json(config_path(server_id))
+        force_stopped = bool(latest.get("force_stopped"))
+        if was_running and not force_stopped:
             run_container(server_id)
             deadline = time.time() + 600
             while time.time() < deadline:
@@ -2009,7 +2375,7 @@ def apply_server_updates(server_id: str, force: bool = False) -> None:
         item["updates_available"] = []
         item["last_update_at"] = time.time()
         item["last_update_check"] = time.time()
-        item["job_state"] = "running" if was_running else "stopped"
+        item["job_state"] = "force-stopped" if item.get("force_stopped") else "running" if was_running else "stopped"
         write_json(config_path(server_id), item)
     except Exception as err:
         item = read_json(config_path(server_id))
@@ -2023,7 +2389,7 @@ def apply_server_updates(server_id: str, force: bool = False) -> None:
 def maintain_server(server_id: str) -> None:
     with server_lock(server_id):
         item = read_json(config_path(server_id))
-        if not item or item.get("updating") or item.get("deleting"):
+        if not item or item.get("force_stopped") or item.get("updating") or item.get("deleting"):
             return
         now = time.time()
         status, container = current_status(server_id)
@@ -2275,6 +2641,76 @@ def curseforge_version_record(version: dict[str, Any], kind: str, game_version: 
         "size": int(version.get("fileLength", 0))}
 
 
+def hangar_version_compatible(supported_versions: Any, game_version: str) -> bool:
+    if not game_version or not isinstance(supported_versions, list):
+        return False
+    candidate = str(game_version).strip()
+    candidate_parts = candidate.split(".")
+    if candidate in {str(value).strip() for value in supported_versions}:
+        return True
+    if not all(part.isdigit() for part in candidate_parts):
+        return False
+    candidate_tuple = tuple(int(part) for part in candidate_parts)
+    for raw in supported_versions:
+        value = str(raw).strip()
+        match = re.fullmatch(r"([0-9]+(?:\.[0-9]+){1,2})-([0-9]+(?:\.[0-9]+){1,2})", value)
+        if not match:
+            continue
+        low_parts, high_parts = match.group(1).split("."), match.group(2).split(".")
+        if not all(part.isdigit() for part in low_parts + high_parts):
+            continue
+        if len(low_parts) == len(high_parts) == 2:
+            family = tuple(int(part) for part in candidate_parts[:2])
+            if len(candidate_parts) >= 2 and tuple(map(int, low_parts)) <= family <= tuple(map(int, high_parts)):
+                return True
+            continue
+        low = tuple(map(int, low_parts)) + (0,) * (3 - len(low_parts))
+        high = tuple(map(int, high_parts)) + (0,) * (3 - len(high_parts))
+        padded = candidate_tuple + (0,) * (3 - len(candidate_tuple))
+        if low <= padded <= high:
+            return True
+    return False
+
+
+def hangar_direct_download_url(value: Any) -> str:
+    candidate = str(value or "").strip()
+    try:
+        parsed = urlsplit(candidate)
+    except ValueError:
+        return ""
+    if (parsed.scheme == "https" and parsed.hostname == "hangarcdn.papermc.io"
+            and parsed.username is None and parsed.password is None
+            and parsed.path.lower().endswith(".jar") and len(candidate) <= 2048):
+        return candidate
+    return ""
+
+
+def hangar_version_record(version: dict[str, Any], game_version: str) -> dict[str, Any]:
+    dependencies = version.get("platformDependenciesFormatted", {}).get("PAPER") or version.get("platformDependencies", {}).get("PAPER") or []
+    download = (version.get("downloads") or {}).get("PAPER") or {}
+    file_info = download.get("fileInfo") or {}
+    url = hangar_direct_download_url(download.get("downloadUrl"))
+    external_url = safe_icon_url(download.get("externalUrl")) or str(download.get("externalUrl") or "")
+    stats = version.get("stats") or {}
+    platform_downloads = stats.get("platformDownloads") or {}
+    return {
+        "id": str(version.get("id", "")),
+        "number": str(version.get("name", "")),
+        "name": str(version.get("name", "")),
+        "game_versions": [str(value) for value in dependencies if isinstance(value, (str, int, float))],
+        "loaders": ["paper"],
+        "targets": [],
+        "compatible": hangar_version_compatible(dependencies, game_version),
+        "version_type": str((version.get("channel") or {}).get("name", "")),
+        "date_published": str(version.get("createdAt", "")),
+        "downloads": int(platform_downloads.get("PAPER", stats.get("totalDownloads", 0)) or 0),
+        "size": int(file_info.get("size", 0) or 0),
+        "download_url": url,
+        "external_url": external_url,
+        "installable": bool(url),
+    }
+
+
 async def validate_pack_version(platform: str, project_id: str, version_id: str, file_id: str, game_version: str, loader: str) -> None:
     if platform == "modrinth":
         if not version_id:
@@ -2348,7 +2784,7 @@ async def validate_mod_version(platform: str, project_id: str, version_id: str, 
     raise HTTPException(status_code=422, detail="Unsupported mod platform.")
 
 
-async def validate_plugin_version(platform: str, project_id: str, version_id: str, file_id: str, game_version: str) -> None:
+async def validate_plugin_version(platform: str, project_id: str, version_id: str, file_id: str, game_version: str) -> dict[str, Any] | None:
     if platform == "modrinth":
         if not version_id:
             raise HTTPException(status_code=422, detail="Select a Modrinth plugin version.")
@@ -2379,6 +2815,21 @@ async def validate_plugin_version(platform: str, project_id: str, version_id: st
         if game_version not in curseforge_game_versions(version.get("gameVersions", [])):
             raise HTTPException(status_code=409, detail="This CurseForge plugin file does not support the server's Minecraft version.")
         return
+    if platform == "hangar":
+        if not project_id.isdigit() or not version_id.isdigit():
+            raise HTTPException(status_code=422, detail="Select a valid Hangar plugin version.")
+        async with httpx.AsyncClient(timeout=20, headers={"Accept": "application/json"}) as client:
+            response = await client.get(f"{HANGAR_BASE}/projects/{project_id}/versions/{version_id}")
+            response.raise_for_status()
+            version = response.json()
+        if str(version.get("projectId", "")) != project_id or str(version.get("id", "")) != version_id:
+            raise HTTPException(status_code=422, detail="The selected version does not belong to this Hangar plugin.")
+        record = hangar_version_record(version, game_version)
+        if record["compatible"] is not True:
+            raise HTTPException(status_code=409, detail="This Hangar plugin version does not support the server's Minecraft version.")
+        if not record["installable"]:
+            raise HTTPException(status_code=409, detail="This Hangar release links to an external download and cannot be installed automatically. Open its Hangar version page to download it from the author's selected source.")
+        return record
     raise HTTPException(status_code=422, detail="Unsupported plugin platform.")
 
 
@@ -2401,6 +2852,39 @@ async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: i
             "downloads": project.get("downloads", 0), "platform": "modrinth", "versions": games[:12],
             "loaders": categories, "compatible": compatible})
     return {"hits": hits, "total_hits": data.get("total_hits", 0)}
+
+
+async def hangar_plugin_search(query: str, item: dict[str, Any], offset: int, sort: str) -> dict[str, Any]:
+    game = await resolve_minecraft_version(item)
+    params = {"q": query, "limit": 24, "offset": offset,
+        "sort": "-downloads" if sort == "downloads" else "-updated"}
+    async with httpx.AsyncClient(timeout=20, headers={"Accept": "application/json"}) as client:
+        response = await client.get(f"{HANGAR_BASE}/projects", params=params)
+        response.raise_for_status()
+        data = response.json()
+    hits = []
+    for project in data.get("result", []):
+        if not isinstance(project, dict):
+            continue
+        namespace = project.get("namespace") or {}
+        owner = str(namespace.get("owner", "")).strip()
+        slug = str(namespace.get("slug", "")).strip()
+        project_id = str(project.get("id", ""))
+        if not project_id.isdigit() or not slug:
+            continue
+        platforms = project.get("supportedPlatforms") or {}
+        supported = platforms.get("PAPER") or []
+        stats = project.get("stats") or {}
+        hits.append({
+            "project_id": project_id, "slug": f"{owner}/{slug}" if owner else slug,
+            "title": str(project.get("name", slug)), "description": str(project.get("description", "")),
+            "icon": str(project.get("avatarUrl", "")), "downloads": int(stats.get("downloads", 0) or 0),
+            "platform": "hangar", "url": f"https://hangar.papermc.io/{quote(owner, safe='')}/{quote(slug, safe='')}" if owner else "",
+            "versions": [str(value) for value in supported[:12]],
+            "compatible": hangar_version_compatible(supported, game),
+        })
+    total = int((data.get("pagination") or {}).get("count", len(hits)) or 0)
+    return {"hits": hits, "total_hits": total}
 
 
 async def curseforge_bedrock_addon_class_id() -> int:
@@ -2580,6 +3064,34 @@ async def download_curseforge_addon(url: str, api_key: str) -> bytes:
 async def lifespan(app: FastAPI):
     global DOCKER_ERROR, HOST_DATA_SOURCE, SHUTTING_DOWN, MAINTENANCE_TASK
     global HOST_NETWORKING_ENABLED, GATEWAY_SECRET
+    cli = None
+    try:
+        cli = docker_client()
+        cli.ping()
+        share_source = docker_self_data_source(cli, "/share")
+        if migrate_private_data_to_share(cli):
+            HOST_DATA_SOURCE = share_source / "game_server_manager"
+        else:
+            set_data_root(LEGACY_DATA_DIR)
+            HOST_DATA_SOURCE = docker_self_data_source(cli, "/data")
+            LOG.warning("Continuing to use private /data because /share migration could not be completed safely.")
+        DOCKER_ERROR = None
+    except Exception as err:
+        DOCKER_ERROR = DOCKER_UNAVAILABLE_MESSAGE
+        if _storage_entries(LEGACY_DATA_DIR):
+            set_data_root(LEGACY_DATA_DIR)
+            LOG.error("Could not prepare /share/game_server_manager; keeping existing files in /data: %s", err)
+            try:
+                HOST_DATA_SOURCE = docker_self_data_source(cli, "/data") if cli is not None else None
+            except Exception:
+                HOST_DATA_SOURCE = None
+        else:
+            set_data_root(SHARE_DATA_DIR)
+            try:
+                HOST_DATA_SOURCE = (docker_self_data_source(cli, "/share") / "game_server_manager") if cli is not None else None
+            except Exception:
+                HOST_DATA_SOURCE = None
+
     DATA_DIR.mkdir(parents=True, exist_ok=True)
     SERVERS_DIR.mkdir(parents=True, exist_ok=True)
     scrub_legacy_settings()
@@ -2590,12 +3102,10 @@ async def lifespan(app: FastAPI):
     except Exception:
         LOG.exception("Could not import legacy server data; original files were left untouched.")
     try:
-        cli = docker_client()
-        cli.ping()
-        HOST_DATA_SOURCE = docker_self_data_source(cli)
+        if cli is None:
+            raise RuntimeError("Docker Engine is unavailable or app storage is not mounted.")
         ensure_minecraft_network(cli)
         await start_gateway_relay()
-        DOCKER_ERROR = None
         configs = all_configs()
         cleanup_stale_gateways({str(item["id"]) for item in configs})
         for item in configs:
@@ -2603,7 +3113,7 @@ async def lifespan(app: FastAPI):
                 await ensure_game_networking(item["id"])
             except OSError:
                 LOG.exception("Could not start Minecraft gateway for %s", item.get("name"))
-            if item.get("desired_state") == "running":
+            if item.get("desired_state") == "running" and not item.get("force_stopped"):
                 submit_job(item["id"], "resume", lambda sid=item["id"]: ensure_running(sid))
     except Exception as err:
         DOCKER_ERROR = DOCKER_UNAVAILABLE_MESSAGE
@@ -2799,6 +3309,7 @@ async def create_server(payload: dict[str, Any]):
         "modpack": modpack, "mods": [], "plugins": [], "bedrock_addons": [], "desired_state": "running", "job_state": "queued",
         "last_player_seen": time.time(), "empty_since": None, "updates_available": [],
         "last_update_check": 0, "updating": False, "auto_paused": False, "auto_stopped": False,
+        "control_generation": 0, "force_stopped": False,
     }
     server_dir(server_id).mkdir(parents=True, exist_ok=True)
     write_json(config_path(server_id), item)
@@ -3005,6 +3516,8 @@ async def start_server(server_id: str):
     if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
         raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
     original = dict(item)
+    item["control_generation"] = int(item.get("control_generation", 0)) + 1
+    item["force_stopped"] = False
     item["desired_state"] = "running"
     item["auto_stopped"] = False
     item["auto_paused"] = False
@@ -3032,6 +3545,59 @@ async def stop_server(server_id: str):
     write_json(config_path(server_id), item)
     job_id = submit_job(server_id, "stop", lambda: stop_container(server_id, False, 120))
     return {"job_id": job_id}
+
+
+@app.post("/api/servers/{server_id}/force-exit")
+async def force_exit_server(server_id: str):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+
+    item["control_generation"] = int(item.get("control_generation", 0)) + 1
+    force_generation = item["control_generation"]
+    item["force_stopped"] = True
+    item["desired_state"] = "stopped"
+    item["job_state"] = "force-stopping"
+    item["updating"] = False
+    item["world_resetting"] = False
+    item["auto_stopped"] = False
+    item["auto_paused"] = False
+    with JOBS_LOCK:
+        delete_already_running = any(
+            job.get("server_id") == server_id
+            and job.get("operation") == "remove server"
+            and job.get("state") == "running"
+            and job.get("executing") is True
+            for job in JOBS.values()
+        )
+    if not delete_already_running:
+        item["deleting"] = False
+    write_json(config_path(server_id), item)
+    cancel_server_jobs(server_id)
+
+    try:
+        await close_game_networking(server_id)
+    except Exception:
+        LOG.exception("Could not close game networking during force exit for server %s", server_id)
+    try:
+        await asyncio.to_thread(stop_container, server_id, False, 0, True)
+    except (DockerException, RuntimeError) as err:
+        raise HTTPException(status_code=503, detail=f"Force exit disabled automatic restarts, but Docker could not stop the server: {err}") from err
+
+    latest = read_json(config_path(server_id))
+    if latest:
+        force_applied = int(latest.get("control_generation", 0)) == force_generation
+        if force_applied:
+            latest["force_stopped"] = True
+            latest["desired_state"] = "stopped"
+            latest["job_state"] = "force-stopped"
+            latest["updating"] = False
+            latest["world_resetting"] = False
+            write_json(config_path(server_id), latest)
+        else:
+            force_applied = bool(latest.get("force_stopped")) and latest.get("desired_state") == "stopped"
+        return {"server": public_server(latest), "stopped": force_applied}
+    return {"stopped": True, "deleted": True}
 
 
 @app.post("/api/servers/{server_id}/update")
@@ -3320,19 +3886,23 @@ async def add_plugin(server_id: str, payload: dict[str, Any]):
     platform = str(payload.get("platform", "")).lower()
     project = payload.get("project") or {}
     project_id = str(project.get("project_id", ""))
-    if platform not in {"modrinth", "curseforge"} or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", project_id):
+    if platform not in {"modrinth", "curseforge", "hangar"} or not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", project_id):
         raise HTTPException(status_code=422, detail="Plugin details are missing.")
-    if platform == "curseforge" and not project_id.isdigit():
-        raise HTTPException(status_code=422, detail="CurseForge project ID must be numeric.")
+    if platform in {"curseforge", "hangar"} and not project_id.isdigit():
+        raise HTTPException(status_code=422, detail=f"{platform.title()} project ID must be numeric.")
+    if platform == "hangar" and str(item.get("server_type", "")).upper() != "PAPER":
+        raise HTTPException(status_code=409, detail="Hangar plugins can only be installed on Paper servers.")
     version_id = str(payload.get("version_id") or "")
     file_id = str(payload.get("file_id") or "")
     if platform == "modrinth" and version_id and not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", version_id):
         raise HTTPException(status_code=422, detail="Modrinth version ID is invalid.")
     if platform == "curseforge" and file_id and not file_id.isdigit():
         raise HTTPException(status_code=422, detail="CurseForge file ID is invalid.")
+    if platform == "hangar" and not version_id.isdigit():
+        raise HTTPException(status_code=422, detail="Hangar version ID must be numeric.")
     game_version = await resolve_minecraft_version(item)
     try:
-        await validate_plugin_version(platform, project_id, version_id, file_id, game_version)
+        hangar_version = await validate_plugin_version(platform, project_id, version_id, file_id, game_version)
     except httpx.HTTPStatusError as err:
         raise HTTPException(status_code=502, detail=f"{platform.title()} returned HTTP {err.response.status_code} while checking plugin compatibility.")
     except httpx.HTTPError as err:
@@ -3340,8 +3910,11 @@ async def add_plugin(server_id: str, payload: dict[str, Any]):
     plugins = list(item.get("plugins", []))
     if any(plugin.get("platform") == platform and plugin.get("project_id") == project_id for plugin in plugins):
         return {"server": public_server(item), "job_id": None, "already_installed": True}
-    plugins.append({"platform": platform, "project_id": project_id, "version_id": version_id, "file_id": file_id,
-        "title": str(project.get("title", "Plugin"))[:120], "slug": str(project.get("slug", ""))[:120]})
+    plugin_record = {"platform": platform, "project_id": project_id, "version_id": version_id, "file_id": file_id,
+        "title": str(project.get("title", "Plugin"))[:120], "slug": str(project.get("slug", ""))[:120]}
+    if platform == "hangar" and hangar_version:
+        plugin_record["download_url"] = hangar_version["download_url"]
+    plugins.append(plugin_record)
     item["plugins"] = plugins
     was_running = item.get("desired_state") == "running"
     write_json(config_path(server_id), item)
@@ -3466,8 +4039,10 @@ async def minecraft_versions(channel: str = "all"):
 
 @app.get("/api/catalog")
 async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", offset: int = 0, sort: str = "downloads"):
-    if kind not in {"mod", "modpack", "plugin", "bedrock_addon"} or platform not in {"modrinth", "curseforge"}:
-        raise HTTPException(status_code=422, detail="Choose Modrinth or CurseForge and a supported category.")
+    if kind not in {"mod", "modpack", "plugin", "bedrock_addon"} or platform not in {"modrinth", "curseforge", "hangar"}:
+        raise HTTPException(status_code=422, detail="Choose a supported catalog and category.")
+    if platform == "hangar" and kind != "plugin":
+        raise HTTPException(status_code=422, detail="Hangar is available for Paper plugins only.")
     if len(q) > 100 or offset < 0:
         raise HTTPException(status_code=422, detail="Search text or page offset is invalid.")
     if sort not in {"downloads", "updated"}:
@@ -3494,7 +4069,11 @@ async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", of
         raise HTTPException(status_code=409, detail="Select a mod loader such as Fabric or Forge in Types before browsing mods.")
     if kind == "plugin" and str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
         raise HTTPException(status_code=409, detail="Select Bukkit, Paper, or Purpur in Types before browsing plugins.")
+    if platform == "hangar" and str(item.get("server_type", "")).upper() != "PAPER":
+        raise HTTPException(status_code=409, detail="Hangar plugins are available when this server uses Paper.")
     try:
+        if platform == "hangar":
+            return await hangar_plugin_search(q, item, offset, sort)
         return await (modrinth_search(kind, q, item, offset, sort) if platform == "modrinth" else curseforge_search(kind, q, item, offset, sort))
     except HTTPException:
         raise
@@ -3506,8 +4085,10 @@ async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", of
 
 @app.get("/api/catalog/{platform}/{project_id}")
 async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", server_id: str = "", offset: int = 0):
-    if platform not in {"modrinth", "curseforge"} or kind not in {"mod", "modpack", "plugin", "bedrock_addon"}:
+    if platform not in {"modrinth", "curseforge", "hangar"} or kind not in {"mod", "modpack", "plugin", "bedrock_addon"}:
         raise HTTPException(status_code=422, detail="Unsupported catalog item.")
+    if platform == "hangar" and kind != "plugin":
+        raise HTTPException(status_code=422, detail="Hangar is available for Paper plugins only.")
     if offset < 0:
         raise HTTPException(status_code=422, detail="Version page offset cannot be negative.")
     item = read_json(config_path(server_id)) if server_id else {"minecraft_version": "LATEST", "mod_loader": ""}
@@ -3517,6 +4098,8 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
         raise HTTPException(status_code=422, detail="Catalog project ID is invalid.")
     if platform == "curseforge" and not project_id.isdigit():
         raise HTTPException(status_code=422, detail="CurseForge project ID must be numeric.")
+    if platform == "hangar" and not project_id.isdigit():
+        raise HTTPException(status_code=422, detail="Hangar project ID must be numeric.")
     if kind == "bedrock_addon":
         if platform != "curseforge":
             raise HTTPException(status_code=422, detail="CurseForge is the supported catalog for Bedrock add-ons.")
@@ -3534,9 +4117,41 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
             raise HTTPException(status_code=502, detail=f"Could not reach CurseForge: {err}")
     if kind == "plugin" and str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
         raise HTTPException(status_code=409, detail="Select Bukkit, Paper, or Purpur in Types before browsing plugins.")
+    if platform == "hangar" and str(item.get("server_type", "")).upper() != "PAPER":
+        raise HTTPException(status_code=409, detail="Hangar plugins are available when this server uses Paper.")
     game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""
     loader = server_mod_loader(item).lower()
     try:
+        if platform == "hangar":
+            async with httpx.AsyncClient(timeout=20, headers={"Accept": "application/json"}) as client:
+                project_response = await client.get(f"{HANGAR_BASE}/projects/{project_id}")
+                project_response.raise_for_status()
+                project = project_response.json()
+                versions_response = await client.get(
+                    f"{HANGAR_BASE}/projects/{project_id}/versions",
+                    params={"limit": 50, "offset": offset, "platform": "PAPER"},
+                )
+                versions_response.raise_for_status()
+                payload = versions_response.json()
+            namespace = project.get("namespace") or {}
+            owner = str(namespace.get("owner", "")).strip()
+            slug = str(namespace.get("slug", "")).strip()
+            versions_data = [v for v in payload.get("result", []) if isinstance(v, dict) and v.get("visibility") == "public"]
+            pagination = payload.get("pagination") or {}
+            total = int(pagination.get("count", len(versions_data)) or 0)
+            return {
+                "project_id": str(project.get("id", project_id)),
+                "slug": f"{owner}/{slug}" if owner else slug,
+                "title": str(project.get("name", slug)),
+                "description": str(project.get("description", "")),
+                "icon": str(project.get("avatarUrl", "")),
+                "platform": platform, "loaders": ["Paper"],
+                "authors": ([{"name": owner, "url": f"https://hangar.papermc.io/{quote(owner, safe='')}"}] if owner else []),
+                "versions": [hangar_version_record(v, game) for v in versions_data],
+                "version_offset": offset, "total_versions": total,
+                "has_more": offset + len(versions_data) < total,
+                "website_url": f"https://hangar.papermc.io/{quote(owner, safe='')}/{quote(slug, safe='')}" if owner and slug else "",
+            }
         if platform == "modrinth":
             async with httpx.AsyncClient(timeout=20, headers=modrinth_headers()) as client:
                 project_response = await client.get(f"{MODRINTH_BASE}/project/{project_id}")

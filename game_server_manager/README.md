@@ -7,7 +7,8 @@ Manage dedicated game servers from a Home Assistant ingress dashboard. Minecraft
 - Create independent Minecraft Java and Bedrock server cards as the host can support.
 - Enable Bedrock cross-play on a Java server to install Geyser and Floodgate automatically.
 - Each card shows its running or stopped state and a three-dot menu for Start/Stop, Terminal, and Settings.
-- Use the Types, Mods, Plugins, and Add-ons tabs to select software, browse Modrinth or CurseForge content, and manage compatible mods, plugins, or Bedrock add-ons. Tabs remain visible and are disabled when they do not apply to the selected server type.
+- Use the Types, Mods, Plugins, and Add-ons tabs to select software, browse Modrinth, CurseForge, or Hangar content, and manage compatible mods, plugins, or Bedrock add-ons. Hangar is the default plugin catalog for Paper; Modrinth and CurseForge remain available. Tabs remain visible and are disabled when they do not apply to the selected server type.
+- Use **Force exit** when a server is stuck booting or restarting, or when an operation is blocking normal controls. It cancels queued jobs, disables automatic container restarts, and removes the container immediately while preserving the server files in `/share`. Older operations cannot start it again until you choose **Start**.
 - Browse Bedrock add-ons from CurseForge or upload a local <code>.mcaddon</code>/<code>.mcpack</code> file. Add-ons are enabled for the current Bedrock world and the server restarts to apply changes.
 - Use the built-in console to view live logs and send commands. Java uses private RCON; Bedrock uses the upstream image's <code>send-command</code> helper.
 - Set world name, seed, game mode, difficulty, player limit, and access controls before creating the server.
@@ -55,13 +56,13 @@ The manager requires EULA acceptance before it creates a Java or Bedrock server.
 
 ## Versions and catalogs
 
-Java Vanilla, Paper, Purpur, and mod loaders use the selected Minecraft version. Snapshot selection is disabled for Bukkit, Paper, and Purpur servers. Modrinth packs and mods are filtered for the selected game version and loader. CurseForge browsing and file lookups require an API key from the CurseForge developer console; save it in the dashboard's catalog settings. Bedrock add-on browsing and downloads use that same key, and the catalog offers files packaged as <code>.mcaddon</code> or <code>.mcpack</code>. Bedrock servers accept <code>LATEST</code>, <code>PREVIEW</code>, or a specific Bedrock Dedicated Server version.
+Java Vanilla, Paper, Purpur, and mod loaders use the selected Minecraft version. Snapshot selection is disabled for Bukkit, Paper, and Purpur servers. Modrinth packs and mods are filtered for the selected game version and loader. Paper plugin browsing defaults to Hangar and checks Hangar's Paper version compatibility; Modrinth and CurseForge remain available from the same Plugins tab. Hangar versions hosted on Hangar's CDN can be installed directly. Versions that link to an external download show the author's chosen source and require manual installation. CurseForge browsing and file lookups require an API key from the CurseForge developer console; save it in the dashboard's catalog settings. Bedrock add-on browsing and downloads use that same key, and the catalog offers files packaged as <code>.mcaddon</code> or <code>.mcpack</code>. Bedrock servers accept <code>LATEST</code>, <code>PREVIEW</code>, or a specific Bedrock Dedicated Server version.
 
 A pack, loader, or server type change can make an existing world or installed content incompatible. The dashboard asks for confirmation before applying a type change. Bukkit, Paper, and Purpur plugin management is in the dedicated Plugins tab; Mods is for compatible mod loaders.
 
 ## Backups, migration, and removal
 
-Worlds are stored under the app's /data/servers/ directory and are included in Home Assistant app backups. Backups are cold: when Home Assistant stops the manager for a backup, it stops managed Minecraft containers cleanly first.
+Server files are stored in Home Assistant's shared folder at /share/game_server_manager/servers/<server-id>/data/. In File Editor, open /share/game_server_manager/. Existing files are moved from the app's private /data/ storage the first time the updated app starts. Home Assistant's own /data/options.json remains in its platform-managed location. Include the Share folder in backups; Home Assistant's recommended automatic backup setup excludes it by default. Backups are cold: when Home Assistant stops the manager for a backup, it stops managed game-server containers cleanly first.
 
 On upgrade from the previous Vanilla app, the manager imports /share/minecraft-vanilla into a managed server folder and leaves the original files untouched.
 

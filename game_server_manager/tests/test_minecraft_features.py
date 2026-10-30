@@ -60,6 +60,7 @@ class MinecraftDriverTests(unittest.TestCase):
     def test_crossplay_installs_geyser_and_floodgate_and_publishes_bedrock_port(self) -> None:
         item = {"server_type": "PAPER", "crossplay_enabled": True, "crossplay_port": 19133}
         environment = MINECRAFT_DRIVER.environment_for(item, {})
+        self.assertEqual(environment["ENFORCE_SECURE_PROFILE"], "false")
         self.assertEqual(environment["PLUGINS"], "\n".join([
             "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot",
             "https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot",
@@ -74,7 +75,17 @@ class MinecraftDriverTests(unittest.TestCase):
     def test_non_crossplay_keeps_standard_plugin_and_modrinth_settings(self) -> None:
         environment = MINECRAFT_DRIVER.environment_for({"server_type": "PAPER"}, {})
         self.assertNotIn("PLUGINS", environment)
+        self.assertNotIn("ENFORCE_SECURE_PROFILE", environment)
         self.assertNotIn("MODRINTH_PROJECTS_DEFAULT_VERSION_TYPE", environment)
+
+    def test_hangar_plugin_jar_is_downloaded_only_from_hangar_cdn(self) -> None:
+        environment = MINECRAFT_DRIVER.environment_for({
+            "server_type": "PAPER", "plugins": [
+                {"platform": "hangar", "download_url": "https://hangarcdn.papermc.io/plugins/Owner/Plugin/versions/1/PAPER/Plugin.jar"},
+                {"platform": "hangar", "download_url": "https://example.com/plugin.jar"},
+            ],
+        }, {})
+        self.assertEqual(environment["PLUGINS"], "https://hangarcdn.papermc.io/plugins/Owner/Plugin/versions/1/PAPER/Plugin.jar")
 
 
 class BedrockDriverTests(unittest.TestCase):
@@ -250,6 +261,85 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertEqual(response["docker_error"], main.DOCKER_UNAVAILABLE_MESSAGE)
         self.assertNotIn(secret_error, json.dumps(response))
         self.assertNotIn("old-private-error", json.dumps(response))
+
+
+class ForceExitTests(unittest.TestCase):
+    def test_force_exit_removes_only_the_container(self) -> None:
+        server_id = str(uuid.uuid4())
+        container = Mock()
+        with patch.object(main, "get_container", return_value=container):
+            main.stop_container(server_id, force=True)
+
+        container.update.assert_called_once_with(restart_policy={"Name": "no"})
+        container.remove.assert_called_once_with(force=True, v=False)
+
+    def test_stale_server_config_write_cannot_undo_force_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "server.json"
+            server_id = str(uuid.uuid4())
+            path.write_text(json.dumps({
+                "id": server_id, "control_generation": 3,
+                "force_stopped": True, "desired_state": "stopped",
+                "job_state": "force-stopped", "updating": False,
+                "world_resetting": False, "deleting": False,
+            }), encoding="utf-8")
+
+            main.write_json(path, {
+                "id": server_id, "control_generation": 2,
+                "force_stopped": False, "desired_state": "running",
+                "job_state": "starting", "updating": True,
+                "world_resetting": False, "deleting": False,
+            })
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["control_generation"], 3)
+            self.assertTrue(saved["force_stopped"])
+            self.assertEqual(saved["desired_state"], "stopped")
+            self.assertEqual(saved["job_state"], "force-stopped")
+            self.assertFalse(saved["updating"])
+
+    def test_run_container_skips_force_stopped_server(self) -> None:
+        server_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "server.json"
+            path.write_text(json.dumps({
+                "id": server_id, "game_id": "minecraft", "server_type": "VANILLA",
+                "control_generation": 1, "force_stopped": True,
+                "desired_state": "stopped", "job_state": "force-stopped",
+            }), encoding="utf-8")
+            client = Mock()
+            with patch.object(main, "config_path", return_value=path), \
+                    patch.object(main, "docker_client", return_value=client), \
+                    patch.object(main, "SHUTTING_DOWN", False):
+                main.run_container(server_id)
+
+            client.images.get.assert_not_called()
+            client.containers.create.assert_not_called()
+
+    def test_force_exit_cancels_queued_jobs_for_server(self) -> None:
+        server_id = str(uuid.uuid4())
+        job_id = str(uuid.uuid4())
+        with patch.dict(main.JOBS, {job_id: {
+            "id": job_id, "server_id": server_id, "operation": "restart",
+            "state": "queued", "message": "Queued",
+        }}, clear=True):
+            main.cancel_server_jobs(server_id)
+            self.assertEqual(main.JOBS[job_id]["state"], "cancelled")
+            self.assertIn("force exit", main.JOBS[job_id]["message"].lower())
+
+
+class HangarCatalogTests(unittest.TestCase):
+    def test_hangar_compatibility_matches_exact_and_supported_ranges(self) -> None:
+        self.assertTrue(main.hangar_version_compatible(["1.21.11", "26.1.2"], "1.21.11"))
+        self.assertTrue(main.hangar_version_compatible(["1.20-1.21"], "1.21.11"))
+        self.assertFalse(main.hangar_version_compatible(["1.20-1.21"], "1.22"))
+
+    def test_hangar_installs_only_direct_cdn_jar_urls(self) -> None:
+        self.assertEqual(main.hangar_direct_download_url(
+            "https://hangarcdn.papermc.io/plugins/Owner/Plugin/versions/1/PAPER/Plugin.jar"),
+            "https://hangarcdn.papermc.io/plugins/Owner/Plugin/versions/1/PAPER/Plugin.jar")
+        self.assertEqual(main.hangar_direct_download_url("https://example.com/plugin.jar"), "")
+        self.assertEqual(main.hangar_direct_download_url("http://hangarcdn.papermc.io/plugin.jar"), "")
 
 
 if __name__ == "__main__":

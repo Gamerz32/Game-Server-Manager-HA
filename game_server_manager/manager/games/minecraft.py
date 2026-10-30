@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 import secrets
 from typing import Any
+from urllib.parse import urlsplit
 
 from .base import GameCapabilities
 
@@ -111,6 +112,8 @@ class MinecraftDriver:
             "ENABLE_RCON": "true",
             "RCON_PASSWORD": secrets.token_urlsafe(32),
         }
+        if item.get("crossplay_enabled") is True:
+            env["ENFORCE_SECURE_PROFILE"] = "false"
         if item.get("whitelist_enabled") and item.get("whitelist_players"):
             env["WHITELIST"] = "\n".join(item["whitelist_players"])
         if item.get("server_icon") is True:
@@ -140,13 +143,25 @@ class MinecraftDriver:
                 modrinth_projects.append(project)
         plugin_types = {"BUKKIT", "PAPER", "PURPUR"}
         if str(item.get("server_type", "")).upper() in plugin_types:
+            direct_plugins = []
             if item.get("crossplay_enabled") is True:
                 # Download the official Paper/Spigot plugin builds directly from GeyserMC.
-                env["PLUGINS"] = "\n".join([
+                direct_plugins.extend([
                     "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot",
                     "https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot",
                 ])
             for plugin in item.get("plugins", []):
+                if plugin.get("platform") == "hangar":
+                    url = str(plugin.get("download_url", "")).strip()
+                    try:
+                        parsed = urlsplit(url)
+                    except ValueError:
+                        continue
+                    if (parsed.scheme == "https" and parsed.hostname == "hangarcdn.papermc.io"
+                            and parsed.username is None and parsed.password is None
+                            and parsed.path.lower().endswith(".jar")):
+                        direct_plugins.append(url)
+                    continue
                 if plugin.get("platform") != "modrinth":
                     continue
                 project = str(plugin.get("project_id", ""))
@@ -155,6 +170,8 @@ class MinecraftDriver:
                     project = f"{project}:{version_id}"
                 if project:
                     modrinth_projects.append(project)
+            if direct_plugins:
+                env["PLUGINS"] = "\n".join(dict.fromkeys(direct_plugins))
         curseforge_files = [
             f"{entry.get('project_id')}:{entry.get('file_id')}"
             for entry in item.get("mods", [])

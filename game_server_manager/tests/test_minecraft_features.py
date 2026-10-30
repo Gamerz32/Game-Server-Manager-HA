@@ -60,6 +60,7 @@ class MinecraftDriverTests(unittest.TestCase):
     def test_crossplay_installs_geyser_and_floodgate_and_publishes_bedrock_port(self) -> None:
         item = {"server_type": "PAPER", "crossplay_enabled": True, "crossplay_port": 19133}
         environment = MINECRAFT_DRIVER.environment_for(item, {})
+        self.assertEqual(environment["ENFORCE_SECURE_PROFILE"], "false")
         self.assertEqual(environment["PLUGINS"], "\n".join([
             "https://download.geysermc.org/v2/projects/geyser/versions/latest/builds/latest/downloads/spigot",
             "https://download.geysermc.org/v2/projects/floodgate/versions/latest/builds/latest/downloads/spigot",
@@ -74,7 +75,17 @@ class MinecraftDriverTests(unittest.TestCase):
     def test_non_crossplay_keeps_standard_plugin_and_modrinth_settings(self) -> None:
         environment = MINECRAFT_DRIVER.environment_for({"server_type": "PAPER"}, {})
         self.assertNotIn("PLUGINS", environment)
+        self.assertNotIn("ENFORCE_SECURE_PROFILE", environment)
         self.assertNotIn("MODRINTH_PROJECTS_DEFAULT_VERSION_TYPE", environment)
+
+    def test_hangar_plugin_jar_is_downloaded_only_from_hangar_cdn(self) -> None:
+        environment = MINECRAFT_DRIVER.environment_for({
+            "server_type": "PAPER", "plugins": [
+                {"platform": "hangar", "download_url": "https://hangarcdn.papermc.io/plugins/Owner/Plugin/versions/1/PAPER/Plugin.jar"},
+                {"platform": "hangar", "download_url": "https://example.com/plugin.jar"},
+            ],
+        }, {})
+        self.assertEqual(environment["PLUGINS"], "https://hangarcdn.papermc.io/plugins/Owner/Plugin/versions/1/PAPER/Plugin.jar")
 
 
 class BedrockDriverTests(unittest.TestCase):
@@ -252,5 +263,238 @@ class SecurityRegressionTests(unittest.TestCase):
         self.assertNotIn("old-private-error", json.dumps(response))
 
 
+class ForceExitTests(unittest.TestCase):
+    def test_force_exit_removes_only_the_container(self) -> None:
+        server_id = str(uuid.uuid4())
+        container = Mock()
+        with patch.object(main, "get_container", return_value=container):
+            main.stop_container(server_id, force=True)
+
+        container.update.assert_called_once_with(restart_policy={"Name": "no"})
+        container.remove.assert_called_once_with(force=True, v=False)
+
+    def test_stale_server_config_write_cannot_undo_force_exit(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "server.json"
+            server_id = str(uuid.uuid4())
+            path.write_text(json.dumps({
+                "id": server_id, "control_generation": 3,
+                "force_stopped": True, "desired_state": "stopped",
+                "job_state": "force-stopped", "updating": False,
+                "world_resetting": False, "deleting": False,
+            }), encoding="utf-8")
+
+            main.write_json(path, {
+                "id": server_id, "control_generation": 2,
+                "force_stopped": False, "desired_state": "running",
+                "job_state": "starting", "updating": True,
+                "world_resetting": False, "deleting": False,
+            })
+
+            saved = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(saved["control_generation"], 3)
+            self.assertTrue(saved["force_stopped"])
+            self.assertEqual(saved["desired_state"], "stopped")
+            self.assertEqual(saved["job_state"], "force-stopped")
+            self.assertFalse(saved["updating"])
+
+    def test_run_container_skips_force_stopped_server(self) -> None:
+        server_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / "server.json"
+            path.write_text(json.dumps({
+                "id": server_id, "game_id": "minecraft", "server_type": "VANILLA",
+                "control_generation": 1, "force_stopped": True,
+                "desired_state": "stopped", "job_state": "force-stopped",
+            }), encoding="utf-8")
+            client = Mock()
+            with patch.object(main, "config_path", return_value=path), \
+                    patch.object(main, "docker_client", return_value=client), \
+                    patch.object(main, "SHUTTING_DOWN", False):
+                main.run_container(server_id)
+
+            client.images.get.assert_not_called()
+            client.containers.create.assert_not_called()
+
+    def test_force_exit_cancels_queued_jobs_for_server(self) -> None:
+        server_id = str(uuid.uuid4())
+        job_id = str(uuid.uuid4())
+        with patch.dict(main.JOBS, {job_id: {
+            "id": job_id, "server_id": server_id, "operation": "restart",
+            "state": "queued", "message": "Queued",
+        }}, clear=True):
+            main.cancel_server_jobs(server_id)
+            self.assertEqual(main.JOBS[job_id]["state"], "cancelled")
+            self.assertIn("force exit", main.JOBS[job_id]["message"].lower())
+
+
+class HangarCatalogTests(unittest.TestCase):
+    def test_hangar_compatibility_matches_exact_and_supported_ranges(self) -> None:
+        self.assertTrue(main.hangar_version_compatible(["1.21.11", "26.1.2"], "1.21.11"))
+        self.assertTrue(main.hangar_version_compatible(["1.20-1.21"], "1.21.11"))
+        self.assertFalse(main.hangar_version_compatible(["1.20-1.21"], "1.22"))
+
+    def test_hangar_installs_only_direct_cdn_jar_urls(self) -> None:
+        self.assertEqual(main.hangar_direct_download_url(
+            "https://hangarcdn.papermc.io/plugins/Owner/Plugin/versions/1/PAPER/Plugin.jar"),
+            "https://hangarcdn.papermc.io/plugins/Owner/Plugin/versions/1/PAPER/Plugin.jar")
+        self.assertEqual(main.hangar_direct_download_url("https://example.com/plugin.jar"), "")
+        self.assertEqual(main.hangar_direct_download_url("http://hangarcdn.papermc.io/plugin.jar"), "")
+
+
+class ManagedPathTests(unittest.TestCase):
+    def test_host_server_data_path_uses_canonical_uuid(self) -> None:
+        server_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "HOST_DATA_SOURCE", Path(temp_dir)):
+            data_path = main.host_server_data_dir(f"{{{server_id.upper()}}}")
+            self.assertEqual(data_path, Path(temp_dir) / "servers" / server_id / "data")
+
+            outside_name = f"outside-{server_id}"
+            with self.assertRaisesRegex(RuntimeError, "Invalid server data path"):
+                main.host_server_data_dir(f"../../{outside_name}")
+            self.assertFalse((Path(temp_dir).parent / outside_name).exists())
+
+    def test_installed_content_archive_uses_fixed_storage_name(self) -> None:
+        server_id = str(uuid.uuid4())
+        content_id = str(uuid.uuid4())
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)):
+            record = {"id": content_id, "kind": "resourcepack", "filename": "creator-pack.zip"}
+            main.apply_java_content_archive(server_id, content_id, "resourcepack", record, b"zip-data", "")
+
+            archive_path = main.content_archive_path(server_id, record)
+            self.assertEqual(archive_path.name, "archive.zip")
+            self.assertEqual(archive_path.read_bytes(), b"zip-data")
+            self.assertEqual(record["filename"], "creator-pack.zip")
+
+    def test_uploaded_plugin_uses_generated_disk_filename(self) -> None:
+        server_id = str(uuid.uuid4())
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("plugin.yml", "name: ImportedPlugin\nversion: 1.0\nmain: example.Plugin\n")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)), \
+                patch.object(main, "stop_container"), patch.object(main, "current_status", return_value=("stopped", None)):
+            server_path = Path(temp_dir) / server_id
+            server_path.mkdir()
+            main.write_json(server_path / "server.json", {
+                "id": server_id, "game_id": "minecraft", "server_type": "PAPER",
+                "desired_state": "stopped", "plugins": [],
+            })
+            response = asyncio.run(main.upload_managed_jar(server_id, "plugin", {
+                "filename": "../outside.jar", "content_base64": encoded(archive_bytes.getvalue()),
+            }))
+
+            plugin = response["server"]["plugins"][0]
+            self.assertEqual(plugin["filename"], "outside.jar")
+            self.assertEqual(plugin["title"], "outside")
+            self.assertRegex(plugin["manual_path"], r"^plugins/[0-9a-f-]+\.jar$")
+            installed_path = server_path / "data" / plugin["manual_path"]
+            self.assertEqual(installed_path.read_bytes(), archive_bytes.getvalue())
+            self.assertFalse((Path(temp_dir) / "outside.jar").exists())
+
+    def test_uploaded_plugin_rejects_symlinked_install_folder(self) -> None:
+        server_id = str(uuid.uuid4())
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("plugin.yml", "name: ImportedPlugin\nversion: 1.0\nmain: example.Plugin\n")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)), \
+                patch.object(main, "stop_container"):
+            server_path = Path(temp_dir) / server_id
+            data_path = server_path / "data"
+            outside_path = Path(temp_dir) / "outside"
+            server_path.mkdir()
+            data_path.mkdir()
+            outside_path.mkdir()
+            (data_path / "plugins").symlink_to(outside_path, target_is_directory=True)
+            main.write_json(server_path / "server.json", {
+                "id": server_id, "game_id": "minecraft", "server_type": "PAPER",
+                "desired_state": "stopped", "plugins": [],
+            })
+
+            with self.assertRaisesRegex(RuntimeError, "Invalid managed file install directory"):
+                asyncio.run(main.upload_managed_jar(server_id, "plugin", {
+                    "filename": "plugin.jar", "content_base64": encoded(archive_bytes.getvalue()),
+                }))
+            self.assertEqual(list(outside_path.iterdir()), [])
+
+    def test_uploaded_plugin_rejects_same_level_folder_alias(self) -> None:
+        server_id = str(uuid.uuid4())
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("plugin.yml", "name: ImportedPlugin\nversion: 1.0\nmain: example.Plugin\n")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)), \
+                patch.object(main, "stop_container"):
+            server_path = Path(temp_dir) / server_id
+            data_path = server_path / "data"
+            mods_path = data_path / "mods"
+            server_path.mkdir()
+            data_path.mkdir()
+            mods_path.mkdir()
+            (data_path / "plugins").symlink_to(mods_path, target_is_directory=True)
+            main.write_json(server_path / "server.json", {
+                "id": server_id, "game_id": "minecraft", "server_type": "PAPER",
+                "desired_state": "stopped", "plugins": [],
+            })
+
+            with self.assertRaisesRegex(RuntimeError, "Invalid managed file install directory"):
+                asyncio.run(main.upload_managed_jar(server_id, "plugin", {
+                    "filename": "plugin.jar", "content_base64": encoded(archive_bytes.getvalue()),
+                }))
+            self.assertEqual(list(mods_path.iterdir()), [])
+
+    def test_modpack_overrides_reject_symlinked_server_directory(self) -> None:
+        server_id = str(uuid.uuid4())
+        content_id = str(uuid.uuid4())
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("overrides/plugins/unexpected.jar", b"plugin data")
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)):
+            server_path = Path(temp_dir) / server_id
+            data_path = server_path / "data"
+            outside_path = Path(temp_dir) / "outside"
+            server_path.mkdir()
+            data_path.mkdir()
+            outside_path.mkdir()
+            (data_path / "plugins").symlink_to(outside_path, target_is_directory=True)
+
+            with self.assertRaisesRegex(RuntimeError, "unsafe parent directory"):
+                main.install_local_modpack_overrides(server_id, content_id, archive_bytes.getvalue())
+            self.assertEqual(list(outside_path.iterdir()), [])
+
+    def test_local_modpack_upload_rejects_symlinked_modpack_directory(self) -> None:
+        server_id = str(uuid.uuid4())
+        archive_bytes = io.BytesIO()
+        with zipfile.ZipFile(archive_bytes, "w") as archive:
+            archive.writestr("modrinth.index.json", json.dumps({
+                "formatVersion": 1,
+                "game": "minecraft",
+                "dependencies": {"minecraft": "1.20.1", "fabric-loader": "0.15.0"},
+            }))
+
+        with tempfile.TemporaryDirectory() as temp_dir, patch.object(main, "SERVERS_DIR", Path(temp_dir)), \
+                patch.object(main, "stop_container"):
+            server_path = Path(temp_dir) / server_id
+            data_path = server_path / "data"
+            outside_path = Path(temp_dir) / "outside"
+            server_path.mkdir()
+            data_path.mkdir()
+            outside_path.mkdir()
+            (data_path / "gsm-modpacks").symlink_to(outside_path, target_is_directory=True)
+            main.write_json(server_path / "server.json", {
+                "id": server_id, "game_id": "minecraft", "server_type": "VANILLA",
+                "desired_state": "stopped", "mods": [], "plugins": [],
+            })
+
+            with self.assertRaisesRegex(RuntimeError, "Invalid modpack storage directory"):
+                asyncio.run(main.upload_local_modpack(server_id, {
+                    "filename": "local.mrpack", "content_base64": encoded(archive_bytes.getvalue()),
+                }))
+            self.assertEqual(list(outside_path.iterdir()), [])
+
+
 if __name__ == "__main__":
     unittest.main()
+

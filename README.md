@@ -21,6 +21,13 @@ Java servers run in their own [itzg/minecraft-server](https://docker-minecraft-s
 - Install updates manually, or enable each server's automatic update policy.
 - Open the manager through Home Assistant's sidebar using app ingress.
 
+## Content catalogs and local imports
+
+The dashboard can browse and install compatible Modrinth and CurseForge resource packs, data packs, and worlds/maps. Paper plugin browsing includes Hangar, while the Mods tab also links to Planet Minecraft. Planet Minecraft is an external browse-and-download link; import downloaded .jar or .zip files through the matching tab. It is not used for modpacks.
+
+Drop supported local files into the matching import area: modpack archives in Types, mod JARs in Mods, plugin JARs in Plugins, Bedrock .mcaddon or .mcpack files in Add-ons, and resource-pack/data-pack/map ZIPs in Content. The add-on saves server files and downloaded content under /share/game_server_manager/servers/. World imports back up the previous world first.
+
+CurseForge uses an API key configured in the Home Assistant add-on Configuration. A temporary session override is available under Catalog Settings. Resource packs installed by the add-on are downloadable from the manager; Minecraft clients need the ZIP at a public HTTPS URL, configured in that Java server's Settings.
 ## Install
 
 1. In Home Assistant, open **Settings → Apps → App Store → Repositories**.
@@ -43,7 +50,7 @@ The manager app itself uses bridge networking. The **Minecraft gateway host netw
 
 ## Data and migration
 
-Server files are stored in Home Assistant's shared folder at `/share/game_server_manager/servers/<server-id>/data/`. In File Editor, open `/share/game_server_manager/`. Existing files are moved from the app's private `/data/` storage the first time the updated app starts. Home Assistant's own `/data/options.json` remains in its platform-managed location. Since the server files are now in the Share folder, include Share in backups; Home Assistant's recommended automatic backup setup excludes it by default. Make a backup before removing the app or changing its data.
+Server files are stored in Home Assistant's shared folder at `/share/game_server_manager/servers/data/`. In File Editor, open `/share/game_server_manager/`. Existing files are moved from the app's private `/data/` storage the first time the updated app starts. Home Assistant's own `/data/options.json` remains in its platform-managed location. Since the server files are now in the Share folder, include Share in backups; Home Assistant's recommended automatic backup setup excludes it by default. Make a backup before removing the app or changing its data.
 
 The Home Assistant app slug is `game_server_manager`. This is a new app identity compared with the earlier Vanilla server app, so Home Assistant uses a new hostname and the old app's data is not automatically moved. The previous Vanilla server's files can be imported from `/share/minecraft-vanilla`; the import keeps the original share copy intact. Keep a backup until the new server and world have been verified.
 
@@ -51,7 +58,7 @@ The Home Assistant app slug is `game_server_manager`. This is a new app identity
 
 Java servers support Vanilla, plugins, mod loaders, and modpacks. Bedrock servers use the upstream Bedrock Dedicated Server image and can be configured to use a stable or preview release. Cross-play creates a Paper-compatible Java server with Geyser and Floodgate installed and sets `enforce-secure-profile=false` for Bedrock-to-Java chat compatibility. The Java port is TCP; the Bedrock cross-play port needs both TCP and UDP. Bedrock and cross-play players connect to the same Java world, with compatibility limits described by [GeyserMC](https://geysermc.org/wiki/geyser/).
 
-Java server automation does not apply to Bedrock Dedicated Servers. Bedrock add-on browsing uses the CurseForge API key saved in catalog settings, and local `.mcaddon` or `.mcpack` files can be uploaded directly. Bedrock cross-play servers disable auto-pause, auto-stop, and wake-on-join because Bedrock traffic uses a direct port. The manager app and its Home Assistant setup remain the same.
+Java server automation does not apply to Bedrock Dedicated Servers. Bedrock add-on browsing uses the key configured in Home Assistant add-on Configuration or a temporary Catalog Settings override, and local `.mcaddon` or `.mcpack` files can be uploaded directly. Bedrock cross-play servers disable auto-pause, auto-stop, and wake-on-join because Bedrock traffic uses a direct port. The manager app and its Home Assistant setup remain the same.
 
 ## AI-assisted development
 

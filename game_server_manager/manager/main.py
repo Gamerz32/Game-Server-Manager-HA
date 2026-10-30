@@ -53,6 +53,7 @@ MC_GAME_ID = 432
 JAVA_TAGS = MINECRAFT_DRIVER.java_tags
 SERVER_TYPES = set(MINECRAFT_DRIVER.server_types)
 CF_CLASS_IDS = {"modpack": 4471, "mod": 6, "plugin": 5}
+CATALOG_CONTENT_KINDS = {"resourcepack", "datapack", "world"}
 MODRINTH_BASE = "https://api.modrinth.com/v2"
 CURSEFORGE_BASE = "https://api.curseforge.com/v1"
 HANGAR_BASE = "https://hangar.papermc.io/api/v1"
@@ -85,6 +86,10 @@ MINECRAFT_VERSION_CACHE: dict[str, Any] = {"expires_at": 0.0, "payload": None}
 BEDROCK_ADDON_MAX_BYTES = 32 * 1024 * 1024
 BEDROCK_ADDON_MAX_EXPANDED_BYTES = 256 * 1024 * 1024
 BEDROCK_ADDON_MAX_FILES = 10000
+CONTENT_ARCHIVE_MAX_BYTES = 128 * 1024 * 1024
+CONTENT_ARCHIVE_MAX_EXPANDED_BYTES = 512 * 1024 * 1024
+CONTENT_ARCHIVE_MAX_FILES = 20000
+MANAGED_JAR_MAX_BYTES = 32 * 1024 * 1024
 
 JOBS: dict[str, dict[str, Any]] = {}
 JOBS_LOCK = threading.Lock()
@@ -223,7 +228,10 @@ def save_settings(value: dict[str, Any]) -> None:
 
 
 def current_curseforge_api_key() -> str:
-    return CURSEFORGE_API_KEY
+    if CURSEFORGE_API_KEY:
+        return CURSEFORGE_API_KEY
+    configured = read_json(OPTIONS_FILE, {}).get("curseforge_api_key", "")
+    return str(configured).strip() if isinstance(configured, str) else ""
 
 
 def scrub_legacy_settings() -> None:
@@ -1191,6 +1199,23 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
     for flag, capability in feature_flags.items():
         if data.get(flag) is True and not getattr(capabilities, capability):
             raise HTTPException(status_code=422, detail=f"{driver.display_name} does not support {flag.replace('_enabled', '').replace('_', ' ')}.")
+    resource_pack_options: dict[str, Any] = {}
+    if driver.game_id == "minecraft":
+        resource_pack_url = str(data.get("resource_pack_url", "")).strip()
+        if len(resource_pack_url) > 2048:
+            raise HTTPException(status_code=422, detail="The resource-pack URL must be 2048 characters or shorter.")
+        if resource_pack_url:
+            parsed_resource_url = urlsplit(resource_pack_url)
+            if parsed_resource_url.scheme != "https" or not parsed_resource_url.hostname or parsed_resource_url.username or parsed_resource_url.password:
+                raise HTTPException(status_code=422, detail="Use an HTTPS resource-pack URL that players can reach without signing in.")
+        resource_pack_sha1 = str(data.get("resource_pack_sha1", "")).strip().lower()
+        if resource_pack_sha1 and not re.fullmatch(r"[0-9a-f]{40}", resource_pack_sha1):
+            raise HTTPException(status_code=422, detail="Resource-pack SHA-1 must contain exactly 40 hexadecimal characters.")
+        resource_pack_options = {
+            "resource_pack_url": resource_pack_url,
+            "resource_pack_sha1": resource_pack_sha1,
+            "resource_pack_enforce": data.get("resource_pack_enforce") is True,
+        }
     return {
         "game_id": driver.game_id,
         "name": name,
@@ -1199,6 +1224,7 @@ def validate_config(data: dict[str, Any], existing_id: str | None = None) -> dic
         "max_ram_mb": max_ram,
         **game_options,
         **world_and_access,
+        **resource_pack_options,
         "auto_pause_enabled": data.get("auto_pause_enabled", False) is True and capabilities.supports_auto_pause and not crossplay_enabled,
         "auto_pause_minutes": bounded_int("auto_pause_minutes", 20, 5, 1440),
         "auto_stop_enabled": data.get("auto_stop_enabled", False) is True and capabilities.supports_auto_stop and not crossplay_enabled,
@@ -1279,7 +1305,7 @@ def run_container(server_id: str) -> None:
             "image": image,
             "name": driver.container_name(server_id),
             "labels": labels,
-            "environment": driver.environment_for(item, settings()),
+            "environment": driver.environment_for(item, {**settings(), "curseforge_api_key": current_curseforge_api_key()}),
             "volumes": {str(data_source): {"bind": "/data", "mode": "rw"}},
             "restart_policy": {"Name": "unless-stopped"},
             "tty": True,
@@ -2479,7 +2505,7 @@ def clean_description(value: str) -> str:
 
 
 def modrinth_headers() -> dict[str, str]:
-    return {"User-Agent": "Gamerz32/Home-Assistant-Gameservers-ADDONS/2.8.5 (Home Assistant app)"}
+    return {"User-Agent": "Gamerz32/Home-Assistant-Gameservers-ADDONS/3.0.0 (Home Assistant app)"}
 
 
 def modrinth_author_links(team_members: Any) -> list[dict[str, str]]:
@@ -2607,7 +2633,7 @@ def modrinth_version_record(version: dict[str, Any], kind: str, game_version: st
         targets = [{"game_version": game, "loader": ""} for game in games]
     files = version.get("files", [])
     size = next((int(f.get("size", 0)) for f in files if f.get("primary")), int(files[0].get("size", 0)) if files else 0)
-    compatible = mod_compatibility(game_version, loader, games, loaders) if kind == "mod" else (game_version in games if kind == "plugin" and game_version else None)
+    compatible = mod_compatibility(game_version, loader, games, loaders) if kind == "mod" else (game_version in games if kind in {"plugin", *CATALOG_CONTENT_KINDS} and game_version else None)
     return {"id": str(version.get("id", "")), "number": str(version.get("version_number", "")),
         "name": str(version.get("name", "")), "game_versions": games, "loaders": loaders, "targets": targets,
         "compatible": compatible,
@@ -2627,6 +2653,8 @@ def curseforge_version_record(version: dict[str, Any], kind: str, game_version: 
         # CurseForge modLoaderType=0 means "Any", not an unsupported loader.
         compatible = game_version in games and (loader_id == 0 or loader.lower() == version_loader)
     elif kind == "plugin" and game_version:
+        compatible = game_version in games
+    elif kind in CATALOG_CONTENT_KINDS and game_version:
         compatible = game_version in games
     else:
         compatible = None
@@ -2731,7 +2759,7 @@ async def validate_pack_version(platform: str, project_id: str, version_id: str,
             raise HTTPException(status_code=422, detail="Select a CurseForge modpack file version.")
         key = current_curseforge_api_key()
         if not key:
-            raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to use CurseForge.")
+            raise HTTPException(status_code=400, detail="Configure a CurseForge API key in Home Assistant add-on Configuration, or enter a temporary key under Catalog Settings.")
         async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
             project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
             project_response.raise_for_status()
@@ -2768,7 +2796,7 @@ async def validate_mod_version(platform: str, project_id: str, version_id: str, 
             raise HTTPException(status_code=422, detail="Select a CurseForge mod file version.")
         key = current_curseforge_api_key()
         if not key:
-            raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to use CurseForge.")
+            raise HTTPException(status_code=400, detail="Configure a CurseForge API key in Home Assistant add-on Configuration, or enter a temporary key under Catalog Settings.")
         async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
             project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
             project_response.raise_for_status()
@@ -2802,7 +2830,7 @@ async def validate_plugin_version(platform: str, project_id: str, version_id: st
             raise HTTPException(status_code=422, detail="Select a CurseForge plugin file version.")
         key = current_curseforge_api_key()
         if not key:
-            raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to use CurseForge.")
+            raise HTTPException(status_code=400, detail="Configure a CurseForge API key in Home Assistant add-on Configuration, or enter a temporary key under Catalog Settings.")
         async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
             project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
             project_response.raise_for_status()
@@ -2834,19 +2862,21 @@ async def validate_plugin_version(platform: str, project_id: str, version_id: st
 
 
 async def modrinth_search(kind: str, query: str, item: dict[str, Any], offset: int, sort: str) -> dict[str, Any]:
+    if kind == "world":
+        raise HTTPException(status_code=422, detail="Modrinth does not offer a world project type. Use CurseForge or import a map archive.")
     index = {"downloads": "downloads", "updated": "updated"}[sort]
     params = {"query": query, "facets": json.dumps([[f"project_type:{kind}"]]), "limit": 24, "offset": offset, "index": index}
     async with httpx.AsyncClient(timeout=20, headers=modrinth_headers()) as client:
         response = await client.get(f"{MODRINTH_BASE}/search", params=params)
         response.raise_for_status()
         data = response.json()
-    game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""
+    game = await resolve_minecraft_version(item) if kind in {"mod", "plugin", *CATALOG_CONTENT_KINDS} else ""
     loader = server_mod_loader(item).lower()
     hits = []
     for project in data.get("hits", []):
         games = [str(v) for v in project.get("versions", [])]
         categories = [str(v).lower() for v in project.get("categories", [])]
-        compatible = mod_compatibility(game, loader, games, categories) if kind == "mod" else (game in games if kind == "plugin" and game else None)
+        compatible = mod_compatibility(game, loader, games, categories) if kind == "mod" else (game in games if kind == "plugin" and game else (game in games if kind in CATALOG_CONTENT_KINDS and game else None))
         hits.append({"project_id": project["project_id"], "slug": project["slug"], "title": project["title"],
             "description": project["description"], "icon": project.get("icon_url", ""),
             "downloads": project.get("downloads", 0), "platform": "modrinth", "versions": games[:12],
@@ -2891,7 +2921,7 @@ async def curseforge_bedrock_addon_class_id() -> int:
     # CurseForge's API terms prohibit caching API data; resolve this only when the user browses Bedrock add-ons.
     key = current_curseforge_api_key()
     if not key:
-        raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
+        raise HTTPException(status_code=400, detail="Configure a CurseForge API key in Home Assistant add-on Configuration, or enter a temporary key under Catalog Settings.")
     async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
         response = await client.get(f"{CURSEFORGE_BASE}/categories", params={"gameId": MC_GAME_ID, "classesOnly": "true"})
         response.raise_for_status()
@@ -2908,18 +2938,66 @@ async def curseforge_bedrock_addon_class_id() -> int:
     raise HTTPException(status_code=502, detail="CurseForge did not return the Minecraft Bedrock Add-ons category. Check the API key and try again.")
 
 
+async def curseforge_content_filter(kind: str) -> tuple[int, int | None]:
+    """Resolve CurseForge class/category IDs from its live category tree."""
+    if kind not in CATALOG_CONTENT_KINDS:
+        return CF_CLASS_IDS[kind], None
+    key = current_curseforge_api_key()
+    if not key:
+        raise HTTPException(status_code=400, detail="Configure a CurseForge API key in the add-on options or Catalog settings to browse CurseForge.")
+    headers = {"x-api-key": key, "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=20, headers=headers) as client:
+        classes_response = await client.get(f"{CURSEFORGE_BASE}/categories", params={"gameId": MC_GAME_ID, "classesOnly": "true"})
+        classes_response.raise_for_status()
+        classes = classes_response.json().get("data", [])
+        if kind == "datapack":
+            class_id = CF_CLASS_IDS["mod"]
+            categories_response = await client.get(f"{CURSEFORGE_BASE}/categories", params={"gameId": MC_GAME_ID, "classId": class_id})
+            categories_response.raise_for_status()
+            categories = categories_response.json().get("data", [])
+            accepted = {"datapack", "datapacks", "datapacksandcrafting", "datapackandcrafting"}
+            for category in categories:
+                if not isinstance(category, dict):
+                    continue
+                names = {re.sub(r"[^a-z0-9]", "", str(category.get(field, "")).lower()) for field in ("slug", "name")}
+                if names & accepted:
+                    try:
+                        return class_id, int(category["id"])
+                    except (KeyError, TypeError, ValueError):
+                        continue
+            raise HTTPException(status_code=502, detail="CurseForge did not return a Data Packs category. Try Modrinth or import a data-pack ZIP.")
+    accepted_names = {
+        "resourcepack": {"texturepack", "texturepacks", "resourcepack", "resourcepacks"},
+        "world": {"world", "worlds", "maps", "map"},
+    }[kind]
+    for category in classes:
+        if not isinstance(category, dict):
+            continue
+        names = {re.sub(r"[^a-z0-9]", "", str(category.get(field, "")).lower()) for field in ("slug", "name")}
+        if names & accepted_names:
+            try:
+                return int(category["id"]), None
+            except (KeyError, TypeError, ValueError):
+                continue
+    label = "Texture Packs / Resource Packs" if kind == "resourcepack" else "Worlds / Maps"
+    raise HTTPException(status_code=502, detail=f"CurseForge did not return its {label} class. Try another source or import an archive.")
+
+
 async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset: int, sort: str) -> dict[str, Any]:
     key = current_curseforge_api_key()
     if not key:
-        raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
+        raise HTTPException(status_code=400, detail="Configure a CurseForge API key in Home Assistant add-on Configuration, or enter a temporary key under Catalog Settings.")
     sort_field = 6 if sort == "downloads" else 3
-    params = {"gameId": MC_GAME_ID, "classId": CF_CLASS_IDS[kind], "searchFilter": query, "index": offset,
+    class_id, category_id = await curseforge_content_filter(kind)
+    params = {"gameId": MC_GAME_ID, "classId": class_id, "searchFilter": query, "index": offset,
         "pageSize": 24, "sortField": sort_field, "sortOrder": "desc"}
+    if category_id is not None:
+        params["categoryId"] = category_id
     async with httpx.AsyncClient(timeout=20, headers={"x-api-key": key, "Accept": "application/json"}) as client:
         response = await client.get(f"{CURSEFORGE_BASE}/mods/search", params=params)
         response.raise_for_status()
         data = response.json()
-    game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""
+    game = await resolve_minecraft_version(item) if kind in {"mod", "plugin", *CATALOG_CONTENT_KINDS} else ""
     loader_id = CF_LOADER_IDS.get(server_mod_loader(item))
     hits = []
     for project in data.get("data", []):
@@ -2947,6 +3025,11 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
                 game in [str(value) for value in (file.get("gameVersion") if isinstance(file.get("gameVersion"), list) else [file.get("gameVersion")])]
                 for file in indexes if isinstance(file, dict) and file.get("gameVersion")
             )
+        elif kind in CATALOG_CONTENT_KINDS and game:
+            compatible = any(
+                game in [str(value) for value in (file.get("gameVersion") if isinstance(file.get("gameVersion"), list) else [file.get("gameVersion")])]
+                for file in indexes if isinstance(file, dict) and file.get("gameVersion")
+            )
         hits.append({"project_id": str(project["id"]), "slug": project.get("slug", str(project["id"])),
             "title": project.get("name", "CurseForge project"), "description": project.get("summary", ""),
             "icon": (project.get("logo") or {}).get("url", ""), "downloads": project.get("downloadCount", 0),
@@ -2957,7 +3040,7 @@ async def curseforge_search(kind: str, query: str, item: dict[str, Any], offset:
 async def curseforge_bedrock_addon_search(query: str, offset: int, sort: str) -> dict[str, Any]:
     key = current_curseforge_api_key()
     if not key:
-        raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
+        raise HTTPException(status_code=400, detail="Configure a CurseForge API key in Home Assistant add-on Configuration, or enter a temporary key under Catalog Settings.")
     class_id = await curseforge_bedrock_addon_class_id()
     params = {"gameId": MC_GAME_ID, "classId": class_id, "searchFilter": query, "index": offset,
         "pageSize": 24, "sortField": 6 if sort == "downloads" else 3, "sortOrder": "desc"}
@@ -2979,7 +3062,7 @@ async def curseforge_bedrock_addon_search(query: str, offset: int, sort: str) ->
 async def curseforge_bedrock_addon_detail(project_id: str, offset: int) -> dict[str, Any]:
     key = current_curseforge_api_key()
     if not key:
-        raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
+        raise HTTPException(status_code=400, detail="Configure a CurseForge API key in Home Assistant add-on Configuration, or enter a temporary key under Catalog Settings.")
     class_id = await curseforge_bedrock_addon_class_id()
     headers = {"x-api-key": key, "Accept": "application/json"}
     async with httpx.AsyncClient(timeout=20, headers=headers) as client:
@@ -3026,7 +3109,7 @@ def validate_curseforge_download_url(url: str) -> None:
         raise HTTPException(status_code=502, detail="CurseForge returned an unsupported add-on download URL.")
 
 
-async def download_curseforge_addon(url: str, api_key: str) -> bytes:
+async def download_curseforge_addon(url: str, api_key: str, max_bytes: int = BEDROCK_ADDON_MAX_BYTES) -> bytes:
     current_url = url
     for _ in range(6):
         validate_curseforge_download_url(current_url)
@@ -3045,19 +3128,423 @@ async def download_curseforge_addon(url: str, api_key: str) -> bytes:
                     content_length = int(response.headers.get("content-length", "0"))
                 except ValueError:
                     content_length = 0
-                if content_length > BEDROCK_ADDON_MAX_BYTES:
-                    raise HTTPException(status_code=413, detail="Bedrock add-ons must be 32 MB or smaller.")
+                if content_length > max_bytes:
+                    raise HTTPException(status_code=413, detail=f"The downloaded file must be {max_bytes // (1024 * 1024)} MB or smaller.")
                 chunks: list[bytes] = []
                 total = 0
                 async for chunk in response.aiter_bytes():
                     total += len(chunk)
-                    if total > BEDROCK_ADDON_MAX_BYTES:
-                        raise HTTPException(status_code=413, detail="Bedrock add-ons must be 32 MB or smaller.")
+                    if total > max_bytes:
+                        raise HTTPException(status_code=413, detail=f"The downloaded file must be {max_bytes // (1024 * 1024)} MB or smaller.")
                     chunks.append(chunk)
                 if not chunks:
                     raise HTTPException(status_code=422, detail="CurseForge returned an empty add-on file.")
                 return b"".join(chunks)
     raise HTTPException(status_code=502, detail="CurseForge returned too many redirects while downloading this add-on.")
+
+
+def safe_content_filename(filename: Any, kind: str) -> str:
+    if not isinstance(filename, str):
+        raise HTTPException(status_code=422, detail="The content archive filename is invalid.")
+    base = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    if len(base) > 180 or any(ord(char) < 32 or ord(char) == 127 for char in base):
+        raise HTTPException(status_code=422, detail="The content archive filename is invalid.")
+    if Path(base).suffix.lower() != ".zip":
+        raise HTTPException(status_code=422, detail="Java resource packs, data packs, and worlds must be ZIP archives.")
+    safe_stem = re.sub(r"[^A-Za-z0-9._ -]", "_", Path(base).stem).strip(" .")[:140] or kind
+    return f"{safe_stem}.zip"
+
+
+def inspect_content_archive(filename: Any, archive: bytes, kind: str) -> tuple[str, str]:
+    safe_filename = safe_content_filename(filename, kind)
+    if not archive or len(archive) > CONTENT_ARCHIVE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Content archives must be 128 MB or smaller.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            infos = bundle.infolist()
+            if len(infos) > CONTENT_ARCHIVE_MAX_FILES:
+                raise HTTPException(status_code=422, detail="The archive contains too many files.")
+            total_size = 0
+            names: set[str] = set()
+            markers: list[PurePosixPath] = []
+            for info in infos:
+                name = info.filename
+                if not name or "\\" in name or "\x00" in name or info.flag_bits & 0x1:
+                    raise HTTPException(status_code=422, detail="The archive contains an unsafe or encrypted entry.")
+                path = PurePosixPath(name)
+                if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts) or ":" in path.parts[0]:
+                    raise HTTPException(status_code=422, detail="The archive contains a path outside its package folder.")
+                mode = (info.external_attr >> 16) & 0xFFFF
+                file_type = stat.S_IFMT(mode)
+                if file_type not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                    raise HTTPException(status_code=422, detail="The archive contains a link or special file.")
+                if info.is_dir():
+                    continue
+                if name in names:
+                    raise HTTPException(status_code=422, detail="The archive contains duplicate file paths.")
+                names.add(name)
+                total_size += int(info.file_size)
+                if total_size > CONTENT_ARCHIVE_MAX_EXPANDED_BYTES:
+                    raise HTTPException(status_code=413, detail="The expanded archive must be 512 MB or smaller.")
+                if kind in {"resourcepack", "datapack"} and path.name == "pack.mcmeta":
+                    markers.append(path.parent)
+                elif kind == "world" and path.name.lower() == "level.dat":
+                    markers.append(path.parent)
+            if not markers:
+                expected = "pack.mcmeta" if kind in {"resourcepack", "datapack"} else "level.dat"
+                raise HTTPException(status_code=422, detail=f"The ZIP does not contain a {expected} file.")
+            # A single wrapper directory is common in downloads. Strip it while
+            # installing so the game sees the expected marker at the package root.
+            root = min(markers, key=lambda value: len(value.parts))
+            bad_file = bundle.testzip()
+            if bad_file:
+                raise HTTPException(status_code=422, detail="The ZIP archive failed its integrity check.")
+            return safe_filename, root.as_posix() if root.parts else ""
+    except zipfile.BadZipFile as err:
+        raise HTTPException(status_code=422, detail="Choose a valid ZIP archive.") from err
+
+
+def extract_content_archive(archive: bytes, destination: Path, root_prefix: str) -> None:
+    root_parts = PurePosixPath(root_prefix).parts if root_prefix else ()
+    destination.mkdir(parents=True, exist_ok=False)
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            for info in bundle.infolist():
+                path = PurePosixPath(info.filename)
+                if path.parts[:len(root_parts)] != root_parts:
+                    continue
+                relative = path.parts[len(root_parts):]
+                if not relative:
+                    continue
+                output = destination.joinpath(*relative)
+                if destination.resolve() not in output.resolve().parents and output.resolve() != destination.resolve():
+                    raise RuntimeError("The archive contains a path outside its package folder.")
+                if info.is_dir():
+                    output.mkdir(parents=True, exist_ok=True)
+                    continue
+                output.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.open(info) as source, output.open("xb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+    except Exception:
+        shutil.rmtree(destination, ignore_errors=True)
+        raise
+
+
+def content_archive_path(server_id: str, record: dict[str, Any]) -> Path:
+    relative = str(record.get("archive_path", ""))
+    root = server_dir(server_id).resolve()
+    path = (root / relative).resolve()
+    if root not in path.parents or not path.is_file():
+        raise HTTPException(status_code=404, detail="The saved content archive was not found.")
+    return path
+
+
+async def download_catalog_content(platform: str, kind: str, project_id: str, version_id: str, file_id: str, game_version: str) -> tuple[str, bytes, dict[str, Any]]:
+    api_key = current_curseforge_api_key()
+    if platform == "modrinth":
+        if not version_id:
+            raise HTTPException(status_code=422, detail="Select a Modrinth content version.")
+        async with httpx.AsyncClient(timeout=25, headers=modrinth_headers()) as client:
+            response = await client.get(f"{MODRINTH_BASE}/version/{version_id}")
+            response.raise_for_status()
+            version = response.json()
+        if str(version.get("project_id", "")) != project_id:
+            raise HTTPException(status_code=422, detail="The selected version does not belong to this project.")
+        record = modrinth_version_record(version, kind, game_version, "")
+        if record["compatible"] is not True:
+            raise HTTPException(status_code=409, detail="This content version does not list the server's Minecraft version.")
+        files = version.get("files", [])
+        selected_file = next((entry for entry in files if entry.get("primary")), files[0] if files else None)
+        if not isinstance(selected_file, dict):
+            raise HTTPException(status_code=422, detail="Modrinth did not provide a downloadable ZIP file.")
+        filename = str(selected_file.get("filename", "content.zip"))
+        url = str(selected_file.get("url", ""))
+        if not url or (urlsplit(url).hostname or "").lower() != "cdn.modrinth.com" or urlsplit(url).scheme != "https":
+            raise HTTPException(status_code=502, detail="Modrinth returned an unsupported download URL.")
+        async with httpx.AsyncClient(timeout=90, follow_redirects=False) as client:
+            async with client.stream("GET", url) as download:
+                download.raise_for_status()
+                data = bytearray()
+                async for chunk in download.aiter_bytes():
+                    data.extend(chunk)
+                    if len(data) > CONTENT_ARCHIVE_MAX_BYTES:
+                        raise HTTPException(status_code=413, detail="Content archives must be 128 MB or smaller.")
+        return filename, bytes(data), record
+    if platform != "curseforge" or not project_id.isdigit() or not file_id.isdigit():
+        raise HTTPException(status_code=422, detail="Choose a supported catalog version.")
+    if not api_key:
+        raise HTTPException(status_code=400, detail="Configure a CurseForge API key in the add-on options or Catalog settings to browse CurseForge.")
+    expected_class, expected_category = await curseforge_content_filter(kind)
+    headers = {"x-api-key": api_key, "Accept": "application/json"}
+    async with httpx.AsyncClient(timeout=25, headers=headers) as client:
+        project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
+        project_response.raise_for_status()
+        project = project_response.json().get("data", {})
+        require_curseforge_distribution(project)
+        try:
+            project_class = int(project.get("classId", 0))
+            project_categories = {int(value.get("id")) for value in project.get("categories", []) if isinstance(value, dict) and value.get("id") is not None}
+        except (TypeError, ValueError):
+            project_class, project_categories = 0, set()
+        if project_class != expected_class or (expected_category is not None and expected_category not in project_categories):
+            raise HTTPException(status_code=422, detail="This CurseForge project is not the selected content type.")
+        file_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/files/{file_id}")
+        file_response.raise_for_status()
+        file_data = file_response.json().get("data", {})
+        if str(file_data.get("modId", "")) != project_id or not file_data.get("isAvailable", True):
+            raise HTTPException(status_code=422, detail="This CurseForge file is unavailable or belongs to another project.")
+        version_record = curseforge_version_record(file_data, kind, game_version, "")
+        if version_record["compatible"] is not True:
+            raise HTTPException(status_code=409, detail="This content version does not list the server's Minecraft version.")
+        filename = str(file_data.get("fileName", "content.zip"))
+        url = str(file_data.get("downloadUrl", ""))
+    if not url:
+        raise HTTPException(status_code=422, detail="CurseForge did not provide a downloadable file for this release.")
+    archive = await download_curseforge_addon(url, api_key, CONTENT_ARCHIVE_MAX_BYTES)
+    return filename, archive, version_record
+
+
+def apply_java_content_archive(server_id: str, content_id: str, kind: str, record: dict[str, Any], archive: bytes, root_prefix: str) -> None:
+    server_root = server_dir(server_id)
+    content_root = server_root / "content" / content_id
+    content_root.mkdir(parents=True, exist_ok=False)
+    archive_path = content_root / record["filename"]
+    archive_path.write_bytes(archive)
+    record["archive_path"] = archive_path.relative_to(server_root).as_posix()
+    record["size"] = len(archive)
+    record["sha1"] = hashlib.sha1(archive).hexdigest()
+    if kind == "datapack":
+        world = world_data_targets(server_id, read_json(config_path(server_id)))[0]
+        datapacks = world / "datapacks"
+        datapacks.mkdir(parents=True, exist_ok=True)
+        pack_folder = datapacks / content_id
+        extract_content_archive(archive, pack_folder, root_prefix)
+        record["install_path"] = pack_folder.relative_to(server_root).as_posix()
+    elif kind == "world":
+        staging = content_root / "world-staging"
+        extract_content_archive(archive, staging, root_prefix)
+        item = read_json(config_path(server_id))
+        targets = world_data_targets(server_id, item)
+        backup_root = server_root / "backups" / f"world-{content_id}"
+        moved: list[tuple[Path, Path]] = []
+        try:
+            backup_root.mkdir(parents=True, exist_ok=False)
+            for index, target in enumerate(targets):
+                if target.exists() or target.is_symlink():
+                    backup = backup_root / str(index)
+                    backup.parent.mkdir(parents=True, exist_ok=True)
+                    target.replace(backup)
+                    moved.append((backup, target))
+            targets[0].parent.mkdir(parents=True, exist_ok=True)
+            staging.replace(targets[0])
+            record["backup_path"] = backup_root.relative_to(server_root).as_posix()
+            record["install_path"] = targets[0].relative_to(server_root).as_posix()
+        except Exception:
+            for backup, target in reversed(moved):
+                if backup.exists() and not target.exists():
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    backup.replace(target)
+            raise
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+    items = read_json(config_path(server_id))
+    items.setdefault("content_items", []).append(record)
+    write_json(config_path(server_id), items)
+
+
+def queue_java_content_change(server_id: str, content_id: str, kind: str, record: dict[str, Any], archive: bytes, root_prefix: str) -> str:
+    item = read_json(config_path(server_id))
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
+    keep_running = item.get("desired_state") == "running"
+    item["updating"] = True
+    item["world_resetting"] = kind == "world"
+    item["job_state"] = "content-queued"
+    write_json(config_path(server_id), item)
+
+    def apply_content():
+        restart_attempted = False
+        try:
+            stop_container(server_id, remove=True, timeout=120)
+            apply_java_content_archive(server_id, content_id, kind, record, archive, root_prefix)
+            latest = read_json(config_path(server_id))
+            if latest and keep_running:
+                latest["desired_state"] = "running"
+                latest["force_stopped"] = False
+                write_json(config_path(server_id), latest)
+                restart_attempted = True
+                run_container(server_id)
+        except Exception:
+            latest = read_json(config_path(server_id))
+            if keep_running and latest and not restart_attempted and not latest.get("force_stopped"):
+                try:
+                    run_container(server_id)
+                except Exception:
+                    LOG.exception("Could not restart server %s after content installation failed", server_id)
+            raise
+        finally:
+            latest = read_json(config_path(server_id))
+            if latest:
+                latest["updating"] = False
+                latest["world_resetting"] = False
+                latest["job_state"] = "running" if keep_running and not latest.get("force_stopped") else "stopped"
+                write_json(config_path(server_id), latest)
+
+    return submit_job(server_id, f"install {kind}", apply_content)
+
+
+@app.post("/api/servers/{server_id}/content/{kind}")
+async def install_catalog_content(server_id: str, kind: str, payload: dict[str, Any]):
+    if kind not in CATALOG_CONTENT_KINDS:
+        raise HTTPException(status_code=422, detail="Choose a resource pack, data pack, or world.")
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    if game_driver_for(item).game_id != "minecraft":
+        raise HTTPException(status_code=409, detail="Java resource packs, data packs, and maps are currently available for Minecraft Java servers.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
+    platform = str(payload.get("platform", "")).lower()
+    if platform not in {"modrinth", "curseforge"} or (platform == "modrinth" and kind == "world"):
+        raise HTTPException(status_code=422, detail="Choose Modrinth or CurseForge for this content type.")
+    project = payload.get("project") or {}
+    project_id = str(project.get("project_id", ""))
+    version_id = str(payload.get("version_id", ""))
+    file_id = str(payload.get("file_id", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", project_id):
+        raise HTTPException(status_code=422, detail="Project details are missing.")
+    if platform == "curseforge" and (not project_id.isdigit() or not file_id.isdigit()):
+        raise HTTPException(status_code=422, detail="Choose a published CurseForge file version.")
+    if platform == "modrinth" and not re.fullmatch(r"[A-Za-z0-9_-]{1,100}", version_id):
+        raise HTTPException(status_code=422, detail="Choose a published Modrinth version.")
+    game_version = await resolve_minecraft_version(item)
+    try:
+        filename, archive, version = await download_catalog_content(platform, kind, project_id, version_id, file_id, game_version)
+        filename, root_prefix = inspect_content_archive(filename, archive, kind)
+    except HTTPException:
+        raise
+    except httpx.HTTPStatusError as err:
+        raise HTTPException(status_code=502, detail=f"{platform.title()} returned HTTP {err.response.status_code} while checking this file.")
+    except httpx.HTTPError as err:
+        raise HTTPException(status_code=502, detail=f"Could not download this content: {err}")
+    content_id = str(uuid.uuid4())
+    record = {"id": content_id, "kind": kind, "platform": platform, "project_id": project_id,
+        "version_id": version_id, "file_id": file_id, "title": str(project.get("title", "Minecraft content"))[:120],
+        "slug": str(project.get("slug", ""))[:120], "version": str(version.get("number", ""))[:120], "filename": filename}
+    if kind == "resourcepack":
+        apply_java_content_archive(server_id, content_id, kind, record, archive, root_prefix)
+        return {"server": public_server(read_json(config_path(server_id))), "job_id": None,
+            "download_url": f"api/servers/{server_id}/content/{content_id}/download"}
+    job_id = queue_java_content_change(server_id, content_id, kind, record, archive, root_prefix)
+    return {"server": public_server(read_json(config_path(server_id))), "job_id": job_id,
+        "download_url": f"api/servers/{server_id}/content/{content_id}/download"}
+
+
+@app.post("/api/servers/{server_id}/content-upload")
+async def upload_java_content(server_id: str, payload: dict[str, Any]):
+    kind = str(payload.get("kind", "")).lower()
+    if kind not in CATALOG_CONTENT_KINDS:
+        raise HTTPException(status_code=422, detail="Choose a resource pack, data pack, or world.")
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    if game_driver_for(item).game_id != "minecraft":
+        raise HTTPException(status_code=409, detail="Java resource packs, data packs, and maps are currently available for Minecraft Java servers.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
+    encoded = payload.get("content_base64")
+    if not isinstance(encoded, str) or len(encoded) > (CONTENT_ARCHIVE_MAX_BYTES * 4 // 3) + 8:
+        raise HTTPException(status_code=413, detail="Content archives must be 128 MB or smaller.")
+    try:
+        archive = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as err:
+        raise HTTPException(status_code=422, detail="The archive upload data is invalid.") from err
+    filename, root_prefix = inspect_content_archive(payload.get("filename"), archive, kind)
+    content_id = str(uuid.uuid4())
+    title = Path(filename).stem[:120]
+    record = {"id": content_id, "kind": kind, "platform": "upload", "title": title,
+        "filename": filename, "version": "Manual upload"}
+    if kind == "resourcepack":
+        apply_java_content_archive(server_id, content_id, kind, record, archive, root_prefix)
+        return {"server": public_server(read_json(config_path(server_id))), "job_id": None}
+    job_id = queue_java_content_change(server_id, content_id, kind, record, archive, root_prefix)
+    return {"server": public_server(read_json(config_path(server_id))), "job_id": job_id}
+
+
+@app.get("/api/servers/{server_id}/content/{content_id}/download")
+async def download_installed_content(server_id: str, content_id: str):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    try:
+        content_id = str(uuid.UUID(content_id))
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail="Saved content not found.") from err
+    record = next((entry for entry in item.get("content_items", []) if entry.get("id") == content_id), None)
+    if not record:
+        raise HTTPException(status_code=404, detail="Saved content not found.")
+    path = content_archive_path(server_id, record)
+    return FileResponse(path, media_type="application/zip", filename=path.name, headers={"Cache-Control": "no-store"})
+
+
+@app.delete("/api/servers/{server_id}/content/{content_id}")
+async def remove_installed_content(server_id: str, content_id: str):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    try:
+        content_id = str(uuid.UUID(content_id))
+    except ValueError as err:
+        raise HTTPException(status_code=404, detail="Saved content not found.") from err
+    record = next((entry for entry in item.get("content_items", []) if entry.get("id") == content_id), None)
+    if not record:
+        raise HTTPException(status_code=404, detail="Saved content not found.")
+    kind = str(record.get("kind", ""))
+    if kind == "world":
+        raise HTTPException(status_code=409, detail="World archives stay available in the saved content library. Use Reset world to create a fresh world.")
+    if kind not in {"resourcepack", "datapack"}:
+        raise HTTPException(status_code=422, detail="Unsupported saved content type.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
+    keep_running = item.get("desired_state") == "running" and kind == "datapack"
+    item["updating"] = keep_running
+    item["job_state"] = "content-remove-queued"
+    write_json(config_path(server_id), item)
+
+    def remove_files():
+        try:
+            if kind == "datapack":
+                stop_container(server_id, remove=True, timeout=120)
+            root = server_dir(server_id).resolve()
+            for path_field in ("install_path", "archive_path"):
+                relative = str(record.get(path_field, ""))
+                if not relative:
+                    continue
+                path = (root / relative).resolve()
+                if root not in path.parents:
+                    raise RuntimeError("Saved content path is outside this server folder.")
+                if path.is_dir():
+                    shutil.rmtree(path)
+                else:
+                    path.unlink(missing_ok=True)
+            latest = read_json(config_path(server_id))
+            latest["content_items"] = [entry for entry in latest.get("content_items", []) if entry.get("id") != content_id]
+            write_json(config_path(server_id), latest)
+            if keep_running:
+                run_container(server_id)
+        finally:
+            latest = read_json(config_path(server_id))
+            if latest:
+                latest["updating"] = False
+                latest["job_state"] = "running" if keep_running and not latest.get("force_stopped") else "stopped"
+                write_json(config_path(server_id), latest)
+
+    if keep_running:
+        job_id = submit_job(server_id, "remove datapack", remove_files)
+    else:
+        remove_files()
+        job_id = None
+    return {"server": public_server(read_json(config_path(server_id))), "job_id": job_id}
 
 
 @asynccontextmanager
@@ -3241,7 +3728,7 @@ async def get_settings():
 async def put_settings(payload: dict[str, Any]):
     global CURSEFORGE_API_KEY
     CURSEFORGE_API_KEY = str(payload.get("curseforge_api_key", "")).strip()
-    return {"curseforge_key_set": bool(CURSEFORGE_API_KEY)}
+    return {"curseforge_key_set": bool(current_curseforge_api_key())}
 
 
 @app.get("/api/games")
@@ -3722,7 +4209,7 @@ async def add_curseforge_bedrock_addon(server_id: str, payload: dict[str, Any]):
         raise HTTPException(status_code=422, detail="Select a valid CurseForge Bedrock add-on file.")
     key = current_curseforge_api_key()
     if not key:
-        raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to download from CurseForge.")
+        raise HTTPException(status_code=400, detail="Configure a CurseForge API key in Home Assistant add-on Configuration, or enter a temporary key under Catalog Settings.")
     try:
         class_id = await curseforge_bedrock_addon_class_id()
         headers = {"x-api-key": key, "Accept": "application/json"}
@@ -3796,6 +4283,271 @@ async def remove_bedrock_addon(server_id: str, addon_id: str):
     return {"server": public_server(busy_item), "job_id": job_id}
 
 
+def remove_uploaded_managed_files(server_id: str, entries: list[dict[str, Any]], folder_name: str) -> None:
+    data_root = (server_dir(server_id) / "data").resolve()
+    allowed_root = (data_root / folder_name).resolve()
+    for entry in entries:
+        if entry.get("platform") != "upload":
+            continue
+        relative = PurePosixPath(str(entry.get("manual_path", "")))
+        if relative.is_absolute() or relative.parts[:1] != (folder_name,) or any(part in {"", ".", ".."} for part in relative.parts):
+            continue
+        path = (data_root.joinpath(*relative.parts)).resolve()
+        if allowed_root not in path.parents:
+            continue
+        path.unlink(missing_ok=True)
+
+
+def parse_local_modpack(filename: Any, archive: bytes) -> dict[str, Any]:
+    if not isinstance(filename, str):
+        raise HTTPException(status_code=422, detail="Choose a .mrpack or exported CurseForge ZIP file.")
+    extension = Path(filename.replace("\\", "/").rsplit("/", 1)[-1]).suffix.lower()
+    if extension not in {".mrpack", ".zip"} or not archive or len(archive) > CONTENT_ARCHIVE_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Modpack archives must be .mrpack or .zip files no larger than 128 MB.")
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            infos = bundle.infolist()
+            if len(infos) > CONTENT_ARCHIVE_MAX_FILES:
+                raise HTTPException(status_code=422, detail="The modpack contains too many files.")
+            expanded = 0
+            names: set[str] = set()
+            for info in infos:
+                name = info.filename
+                path = PurePosixPath(name)
+                if not name or "\\" in name or "\x00" in name or info.flag_bits & 0x1 or path.is_absolute() or any(part in {"", ".", ".."} for part in path.parts) or (path.parts and ":" in path.parts[0]):
+                    raise HTTPException(status_code=422, detail="The modpack archive contains an unsafe or encrypted file entry.")
+                mode = (info.external_attr >> 16) & 0xFFFF
+                if stat.S_IFMT(mode) not in {0, stat.S_IFREG, stat.S_IFDIR}:
+                    raise HTTPException(status_code=422, detail="The modpack archive contains a link or special file.")
+                if not info.is_dir():
+                    if name in names:
+                        raise HTTPException(status_code=422, detail="The modpack archive contains duplicate paths.")
+                    names.add(name)
+                    expanded += int(info.file_size)
+                    if expanded > CONTENT_ARCHIVE_MAX_EXPANDED_BYTES:
+                        raise HTTPException(status_code=413, detail="The expanded modpack must be 512 MB or smaller.")
+            if bundle.testzip():
+                raise HTTPException(status_code=422, detail="The modpack ZIP failed its integrity check.")
+            if extension == ".mrpack":
+                manifest_path = "modrinth.index.json"
+                if manifest_path not in names:
+                    raise HTTPException(status_code=422, detail="The .mrpack is missing modrinth.index.json.")
+                manifest = json.loads(bundle.read(manifest_path).decode("utf-8"))
+                if manifest.get("formatVersion") != 1 or manifest.get("game") != "minecraft":
+                    raise HTTPException(status_code=422, detail="This Modrinth modpack format is not supported.")
+                dependencies = manifest.get("dependencies") or {}
+                game_version = str(dependencies.get("minecraft", "")).strip()
+                loader = next((loader for key, loader in (("fabric-loader", "FABRIC"), ("forge", "FORGE"), ("neoforge", "NEOFORGE"), ("quilt-loader", "QUILT")) if dependencies.get(key)), "")
+                if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", game_version):
+                    raise HTTPException(status_code=422, detail="The Modrinth pack does not declare a valid Minecraft version.")
+                return {"platform": "modrinth", "extension": extension, "game_version": game_version, "loader": loader, "filename": "modpack.mrpack"}
+            manifest_path = "manifest.json"
+            if manifest_path not in names:
+                raise HTTPException(status_code=422, detail="The CurseForge export ZIP is missing manifest.json.")
+            manifest = json.loads(bundle.read(manifest_path).decode("utf-8"))
+            if manifest.get("manifestType") != "minecraftModpack" or manifest.get("manifestVersion") != 1:
+                raise HTTPException(status_code=422, detail="This CurseForge export format is not supported.")
+            minecraft = manifest.get("minecraft") or {}
+            game_version = str(minecraft.get("version", "")).strip()
+            loaders = minecraft.get("modLoaders") or []
+            loader_id = str(next((entry.get("id", "") for entry in loaders if isinstance(entry, dict) and entry.get("primary")), (loaders[0] if loaders and isinstance(loaders[0], dict) else {}).get("id", "")))
+            loader_prefix = loader_id.split("-", 1)[0].lower()
+            loader = {"fabric": "FABRIC", "forge": "FORGE", "neoforge": "NEOFORGE", "quilt": "QUILT"}.get(loader_prefix, "")
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,39}", game_version) or not loader:
+                raise HTTPException(status_code=422, detail="The CurseForge pack must declare a supported Minecraft version and mod loader.")
+            return {"platform": "curseforge", "extension": extension, "game_version": game_version, "loader": loader, "filename": "modpack.zip", "manifest": manifest}
+    except (zipfile.BadZipFile, UnicodeDecodeError, json.JSONDecodeError) as err:
+        raise HTTPException(status_code=422, detail="Choose a valid Modrinth .mrpack or CurseForge export ZIP.") from err
+
+
+def install_local_modpack_overrides(server_id: str, content_id: str, archive: bytes) -> None:
+    data_root = (server_dir(server_id) / "data").resolve()
+    staging = data_root / f".gsm-modpack-overrides-{content_id}"
+    try:
+        with zipfile.ZipFile(io.BytesIO(archive)) as bundle:
+            for info in bundle.infolist():
+                path = PurePosixPath(info.filename)
+                if path.parts[:1] != ("overrides",) or len(path.parts) == 1 or info.is_dir():
+                    continue
+                relative = PurePosixPath(*path.parts[1:])
+                if relative.parts[0].lower() in {"world", "world_nether", "world_the_end", "server.properties", "ops.json", "whitelist.json", "banned-players.json", "banned-ips.json", "gsm-server-icon.png"}:
+                    continue
+                destination = staging.joinpath(*relative.parts)
+                if staging.resolve() not in destination.resolve().parents:
+                    raise RuntimeError("The modpack override archive contains an unsafe path.")
+                destination.parent.mkdir(parents=True, exist_ok=True)
+                with bundle.open(info) as source, destination.open("xb") as target:
+                    shutil.copyfileobj(source, target, length=1024 * 1024)
+        for source in staging.rglob("*"):
+            if not source.is_file():
+                continue
+            relative = source.relative_to(staging)
+            target = data_root / relative
+            if target.exists() or target.is_symlink():
+                raise RuntimeError(f"Modpack override would replace existing server data at {relative.as_posix()}.")
+        for source in staging.rglob("*"):
+            if source.is_file():
+                target = data_root / source.relative_to(staging)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                source.replace(target)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+
+
+@app.post("/api/servers/{server_id}/modpack-upload")
+async def upload_local_modpack(server_id: str, payload: dict[str, Any]):
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    if game_driver_for(item).game_id != "minecraft":
+        raise HTTPException(status_code=409, detail="Local Java modpacks are available for Minecraft Java servers only.")
+    if item.get("crossplay_enabled") or item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="Cross-play or a server operation prevents changing the modpack.")
+    encoded = payload.get("content_base64")
+    if not isinstance(encoded, str) or len(encoded) > (CONTENT_ARCHIVE_MAX_BYTES * 4 // 3) + 8:
+        raise HTTPException(status_code=413, detail="Modpack archives must be 128 MB or smaller.")
+    try:
+        archive = base64.b64decode(encoded, validate=True)
+    except (binascii.Error, ValueError) as err:
+        raise HTTPException(status_code=422, detail="The modpack upload data is invalid.") from err
+    details = parse_local_modpack(payload.get("filename"), archive)
+    content_id = str(uuid.uuid4())
+    pack_root = server_dir(server_id) / "data" / "gsm-modpacks" / content_id
+    pack_root.mkdir(parents=True, exist_ok=False)
+    archive_path = pack_root / details["filename"]
+    archive_path.write_bytes(archive)
+    if details["platform"] == "modrinth":
+        modpack = {"platform": "upload", "project_id": content_id, "title": "Local Modrinth modpack", "local_path": f"/data/gsm-modpacks/{content_id}/{details['filename']}"}
+        server_type = "MODRINTH"
+    else:
+        manifest_path = pack_root / "manifest.json"
+        manifest_path.write_text(json.dumps(details["manifest"], indent=2), encoding="utf-8")
+        modpack = {"platform": "upload", "project_id": content_id, "title": str(details["manifest"].get("name", "Local CurseForge modpack"))[:120], "local_manifest_path": f"/data/gsm-modpacks/{content_id}/manifest.json"}
+        server_type = "AUTO_CURSEFORGE"
+    item.update({"server_type": server_type, "mod_loader": details["loader"], "minecraft_version": details["game_version"],
+        "modpack": modpack, "mods": [], "plugins": [], "updating": True, "job_state": "modpack-import-queued"})
+    write_json(config_path(server_id), item)
+    keep_running = item.get("desired_state") == "running"
+
+    def install_pack():
+        try:
+            stop_container(server_id, remove=True, timeout=120)
+            if details["platform"] == "curseforge":
+                install_local_modpack_overrides(server_id, content_id, archive)
+            latest = read_json(config_path(server_id))
+            if latest and keep_running:
+                latest["desired_state"] = "running"
+                latest["force_stopped"] = False
+                write_json(config_path(server_id), latest)
+                run_container(server_id)
+        finally:
+            latest = read_json(config_path(server_id))
+            if latest:
+                latest["updating"] = False
+                latest["job_state"] = "running" if keep_running and not latest.get("force_stopped") else "stopped"
+                write_json(config_path(server_id), latest)
+
+    if keep_running:
+        job_id = submit_job(server_id, "import modpack", install_pack)
+    else:
+        install_pack()
+        job_id = None
+    return {"server": public_server(read_json(config_path(server_id))), "job_id": job_id}
+
+
+@app.post("/api/servers/{server_id}/managed-files/{kind}")
+async def upload_managed_jar(server_id: str, kind: str, payload: dict[str, Any]):
+    if kind not in {"mod", "plugin"}:
+        raise HTTPException(status_code=422, detail="Choose a mod or plugin JAR.")
+    item = read_json(config_path(server_id))
+    if not item:
+        raise HTTPException(status_code=404, detail="Server not found.")
+    driver = require_game_capability(item, "supports_mods" if kind == "mod" else "supports_plugins", "Mods" if kind == "mod" else "Plugins")
+    if driver.game_id != "minecraft":
+        raise HTTPException(status_code=409, detail=f"{kind.title()} uploads are currently available for Minecraft Java servers.")
+    if kind == "mod" and server_mod_loader(item) not in MOD_LOADERS:
+        raise HTTPException(status_code=409, detail="Choose a compatible mod loader before importing a mod JAR.")
+    if kind == "plugin" and str(item.get("server_type", "")).upper() not in PLUGIN_SERVER_TYPES:
+        raise HTTPException(status_code=409, detail="Choose Bukkit, Paper, or Purpur before importing a plugin JAR.")
+    if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
+        raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
+    filename = payload.get("filename")
+    if not isinstance(filename, str):
+        raise HTTPException(status_code=422, detail="Choose a .jar file.")
+    filename = filename.replace("\\", "/").rsplit("/", 1)[-1].strip()
+    filename = re.sub(r"[^A-Za-z0-9._ -]", "_", filename).strip(" .")[:160]
+    if not filename.lower().endswith(".jar") or filename in {".jar", ""}:
+        raise HTTPException(status_code=422, detail="Choose a file with the .jar extension.")
+    encoded = payload.get("content_base64")
+    if not isinstance(encoded, str) or len(encoded) > (MANAGED_JAR_MAX_BYTES * 4 // 3) + 8:
+        raise HTTPException(status_code=413, detail="Mod and plugin JAR files must be 32 MB or smaller.")
+    try:
+        jar_bytes = base64.b64decode(encoded, validate=True)
+        with zipfile.ZipFile(io.BytesIO(jar_bytes)) as bundle:
+            infos = bundle.infolist()
+            if len(infos) > CONTENT_ARCHIVE_MAX_FILES or sum(info.file_size for info in infos) > CONTENT_ARCHIVE_MAX_EXPANDED_BYTES:
+                raise HTTPException(status_code=413, detail="The JAR archive is too large after expansion.")
+            required = {"plugin.yml", "paper-plugin.yml"} if kind == "plugin" else {"fabric.mod.json", "quilt.mod.json", "mcmod.info"}
+            names = {PurePosixPath(info.filename).name.lower() for info in infos if not info.is_dir()}
+            if kind == "mod" and any(name.endswith("mods.toml") for name in names):
+                required.add("mods.toml")
+            if not names.intersection(required):
+                raise HTTPException(status_code=422, detail=f"The JAR does not contain a recognized {kind} metadata file.")
+    except zipfile.BadZipFile as err:
+        raise HTTPException(status_code=422, detail="Choose a valid JAR archive.") from err
+    except (binascii.Error, ValueError) as err:
+        raise HTTPException(status_code=422, detail="The JAR upload data is invalid.") from err
+    if not jar_bytes or len(jar_bytes) > MANAGED_JAR_MAX_BYTES:
+        raise HTTPException(status_code=413, detail="Mod and plugin JAR files must be 32 MB or smaller.")
+    content_id = str(uuid.uuid4())
+    folder_name = "mods" if kind == "mod" else "plugins"
+    install_folder = server_dir(server_id) / "data" / folder_name
+    destination = install_folder / filename
+    if destination.exists():
+        raise HTTPException(status_code=409, detail=f"A {kind} named {filename} is already installed. Remove it first or rename the file.")
+    item[f"{kind}s"] = list(item.get(f"{kind}s", []))
+    item[f"{kind}s"].append({"platform": "upload", "project_id": content_id, "title": Path(filename).stem[:120], "filename": filename,
+        "manual_path": f"{folder_name}/{filename}"})
+    keep_running = item.get("desired_state") == "running"
+    item["updating"] = True
+    item["job_state"] = f"{kind}-upload-queued"
+    write_json(config_path(server_id), item)
+
+    def install_jar():
+        try:
+            stop_container(server_id, remove=True, timeout=120)
+            install_folder.mkdir(parents=True, exist_ok=True)
+            destination.write_bytes(jar_bytes)
+            latest = read_json(config_path(server_id))
+            if latest and keep_running:
+                latest["desired_state"] = "running"
+                latest["force_stopped"] = False
+                write_json(config_path(server_id), latest)
+                run_container(server_id)
+        except Exception:
+            destination.unlink(missing_ok=True)
+            latest = read_json(config_path(server_id))
+            if latest:
+                latest[f"{kind}s"] = [entry for entry in latest.get(f"{kind}s", []) if entry.get("project_id") != content_id]
+                if keep_running and not latest.get("force_stopped"):
+                    latest["desired_state"] = "running"
+                write_json(config_path(server_id), latest)
+            raise
+        finally:
+            latest = read_json(config_path(server_id))
+            if latest:
+                latest["updating"] = False
+                latest["job_state"] = "running" if keep_running and not latest.get("force_stopped") else "stopped"
+                write_json(config_path(server_id), latest)
+
+    if keep_running:
+        job_id = submit_job(server_id, f"import {kind}", install_jar)
+    else:
+        install_jar()
+        job_id = None
+    return {"server": public_server(read_json(config_path(server_id))), "job_id": job_id}
+
+
 @app.post("/api/servers/{server_id}/mods")
 async def add_mod(server_id: str, payload: dict[str, Any]):
     item = read_json(config_path(server_id))
@@ -3857,17 +4609,20 @@ async def remove_mod(server_id: str, platform: str, project_id: str):
         raise HTTPException(status_code=409, detail=f"Mod removal is not implemented for {driver.display_name} yet.")
     if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
         raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
-    item["mods"] = [m for m in item.get("mods", []) if not (m.get("platform") == platform.lower() and m.get("project_id") == project_id)]
+    removed = [m for m in item.get("mods", []) if m.get("platform") == platform.lower() and m.get("project_id") == project_id]
+    item["mods"] = [m for m in item.get("mods", []) if m not in removed]
     was_running = item.get("desired_state") == "running"
     write_json(config_path(server_id), item)
     job_id = None
     if was_running:
         def apply_mods():
             stop_container(server_id, remove=True)
+            remove_uploaded_managed_files(server_id, removed, "mods")
             run_container(server_id)
         job_id = submit_job(server_id, "remove mod", apply_mods)
     else:
         stop_container(server_id, remove=True)
+        remove_uploaded_managed_files(server_id, removed, "mods")
     return {"server": public_server(item), "job_id": job_id}
 
 
@@ -3939,17 +4694,20 @@ async def remove_plugin(server_id: str, platform: str, project_id: str):
         raise HTTPException(status_code=409, detail=f"Plugin removal is not implemented for {driver.display_name} yet.")
     if item.get("updating") or item.get("world_resetting") or item.get("deleting"):
         raise HTTPException(status_code=409, detail="The server is updating, resetting, or being removed.")
-    item["plugins"] = [plugin for plugin in item.get("plugins", []) if not (plugin.get("platform") == platform.lower() and plugin.get("project_id") == project_id)]
+    removed = [plugin for plugin in item.get("plugins", []) if plugin.get("platform") == platform.lower() and plugin.get("project_id") == project_id]
+    item["plugins"] = [plugin for plugin in item.get("plugins", []) if plugin not in removed]
     was_running = item.get("desired_state") == "running"
     write_json(config_path(server_id), item)
     job_id = None
     if was_running:
         def apply_plugins():
             stop_container(server_id, remove=True)
+            remove_uploaded_managed_files(server_id, removed, "plugins")
             run_container(server_id)
         job_id = submit_job(server_id, "remove plugin", apply_plugins)
     else:
         stop_container(server_id, remove=True)
+        remove_uploaded_managed_files(server_id, removed, "plugins")
     return {"server": public_server(item), "job_id": job_id}
 
 
@@ -4039,8 +4797,10 @@ async def minecraft_versions(channel: str = "all"):
 
 @app.get("/api/catalog")
 async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", offset: int = 0, sort: str = "downloads"):
-    if kind not in {"mod", "modpack", "plugin", "bedrock_addon"} or platform not in {"modrinth", "curseforge", "hangar"}:
+    if kind not in {"mod", "modpack", "plugin", "bedrock_addon", *CATALOG_CONTENT_KINDS} or platform not in {"modrinth", "curseforge", "hangar"}:
         raise HTTPException(status_code=422, detail="Choose a supported catalog and category.")
+    if platform == "modrinth" and kind == "world":
+        raise HTTPException(status_code=422, detail="Modrinth does not offer a world project type.")
     if platform == "hangar" and kind != "plugin":
         raise HTTPException(status_code=422, detail="Hangar is available for Paper plugins only.")
     if len(q) > 100 or offset < 0:
@@ -4085,8 +4845,10 @@ async def catalog(platform: str, kind: str, server_id: str = "", q: str = "", of
 
 @app.get("/api/catalog/{platform}/{project_id}")
 async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", server_id: str = "", offset: int = 0):
-    if platform not in {"modrinth", "curseforge", "hangar"} or kind not in {"mod", "modpack", "plugin", "bedrock_addon"}:
+    if platform not in {"modrinth", "curseforge", "hangar"} or kind not in {"mod", "modpack", "plugin", "bedrock_addon", *CATALOG_CONTENT_KINDS}:
         raise HTTPException(status_code=422, detail="Unsupported catalog item.")
+    if platform == "modrinth" and kind == "world":
+        raise HTTPException(status_code=422, detail="Modrinth does not offer a world project type.")
     if platform == "hangar" and kind != "plugin":
         raise HTTPException(status_code=422, detail="Hangar is available for Paper plugins only.")
     if offset < 0:
@@ -4119,7 +4881,7 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
         raise HTTPException(status_code=409, detail="Select Bukkit, Paper, or Purpur in Types before browsing plugins.")
     if platform == "hangar" and str(item.get("server_type", "")).upper() != "PAPER":
         raise HTTPException(status_code=409, detail="Hangar plugins are available when this server uses Paper.")
-    game = await resolve_minecraft_version(item) if kind in {"mod", "plugin"} else ""
+    game = await resolve_minecraft_version(item) if kind in {"mod", "plugin", *CATALOG_CONTENT_KINDS} else ""
     loader = server_mod_loader(item).lower()
     try:
         if platform == "hangar":
@@ -4127,6 +4889,9 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
                 project_response = await client.get(f"{HANGAR_BASE}/projects/{project_id}")
                 project_response.raise_for_status()
                 project = project_response.json()
+                all_project_types = {str(value) for value in (project.get("all_project_types") or [])}
+                if kind in CATALOG_CONTENT_KINDS and project.get("project_type") not in {kind, None, ""} and kind not in all_project_types:
+                    raise HTTPException(status_code=422, detail="This Modrinth project is not the selected content type.")
                 versions_response = await client.get(
                     f"{HANGAR_BASE}/projects/{project_id}/versions",
                     params={"limit": 50, "offset": offset, "platform": "PAPER"},
@@ -4180,13 +4945,22 @@ async def catalog_detail(platform: str, project_id: str, kind: str = "modpack", 
                 "version_offset": offset, "total_versions": total, "has_more": offset + len(page) < total}
         key = current_curseforge_api_key()
         if not key:
-            raise HTTPException(status_code=400, detail="Add a CurseForge API key in the manager's Settings to browse CurseForge.")
+            raise HTTPException(status_code=400, detail="Configure a CurseForge API key in Home Assistant add-on Configuration, or enter a temporary key under Catalog Settings.")
         headers = {"x-api-key": key, "Accept": "application/json"}
         async with httpx.AsyncClient(timeout=20, headers=headers) as client:
             project_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}")
             project_response.raise_for_status()
             project = project_response.json().get("data", {})
             require_curseforge_distribution(project)
+            if kind in CATALOG_CONTENT_KINDS:
+                expected_class_id, expected_category_id = await curseforge_content_filter(kind)
+                try:
+                    project_class_id = int(project.get("classId", 0))
+                    project_categories = {int(value.get("id")) for value in project.get("categories", []) if isinstance(value, dict) and value.get("id") is not None}
+                except (TypeError, ValueError):
+                    project_class_id, project_categories = 0, set()
+                if project_class_id != expected_class_id or (expected_category_id is not None and expected_category_id not in project_categories):
+                    raise HTTPException(status_code=422, detail="This CurseForge project is not the selected content type.")
             desc_response = await client.get(f"{CURSEFORGE_BASE}/mods/{project_id}/description")
             desc_response.raise_for_status()
             description = clean_description(desc_response.json().get("data", ""))

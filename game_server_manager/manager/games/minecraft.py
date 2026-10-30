@@ -25,6 +25,7 @@ class MinecraftDriver:
         "java_version", "minecraft_version", "crossplay_enabled", "crossplay_port",
         "world_name", "world_seed", "game_mode", "difficulty", "max_players", "pvp_enabled",
         "op_permission_level", "whitelist_enabled", "whitelist_players", "blacklist_enabled",
+        "resource_pack_url", "resource_pack_sha1", "resource_pack_enforce",
         "blacklist_players", "operators",
     )
     capabilities = GameCapabilities(
@@ -112,6 +113,11 @@ class MinecraftDriver:
             "ENABLE_RCON": "true",
             "RCON_PASSWORD": secrets.token_urlsafe(32),
         }
+        resource_pack_url = str(item.get("resource_pack_url", "")).strip()
+        resource_pack_sha1 = str(item.get("resource_pack_sha1", "")).strip()
+        env["RESOURCE_PACK"] = resource_pack_url
+        env["RESOURCE_PACK_SHA1"] = resource_pack_sha1
+        env["RESOURCE_PACK_ENFORCE"] = str(bool(item.get("resource_pack_enforce", False))).upper()
         if item.get("crossplay_enabled") is True:
             env["ENFORCE_SECURE_PROFILE"] = "false"
         if item.get("whitelist_enabled") and item.get("whitelist_players"):
@@ -121,13 +127,17 @@ class MinecraftDriver:
             env["OVERRIDE_ICON"] = "true"
         pack = item.get("modpack") or {}
         if item.get("server_type") == "MODRINTH" and pack:
-            env["MODRINTH_MODPACK"] = str(pack.get("project_id") or pack.get("slug"))
-            if pack.get("version_id"):
+            env["MODRINTH_MODPACK"] = str(pack.get("local_path") or pack.get("project_id") or pack.get("slug"))
+            if pack.get("version_id") and not pack.get("local_path"):
                 env["MODRINTH_VERSION"] = str(pack["version_id"])
         elif item.get("server_type") == "AUTO_CURSEFORGE" and pack:
-            env["CF_SLUG"] = str(pack.get("slug") or pack.get("project_id"))
-            if pack.get("file_id"):
-                env["CF_FILE_ID"] = str(pack["file_id"])
+            if pack.get("local_manifest_path"):
+                env["CF_SLUG"] = "custom"
+                env["CF_MODPACK_MANIFEST"] = str(pack["local_manifest_path"])
+            else:
+                env["CF_SLUG"] = str(pack.get("slug") or pack.get("project_id"))
+                if pack.get("file_id"):
+                    env["CF_FILE_ID"] = str(pack["file_id"])
         modrinth_projects = []
         loader_prefix = self._mod_loader(item)
         for mod in item.get("mods", []):

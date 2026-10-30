@@ -2,7 +2,7 @@ name: "Game Server Manager"
 slug: game_server_manager
 description: >
   Manage dedicated game servers from Home Assistant. Minecraft Java, Bedrock, and cross-play are available now; Worms Armageddon is a WIP option and is currently unavailable.
-version: "3.0.1"
+version: "3.0.2"
 url: https://github.com/Gamerz32/Game-Server-Manager-HA
 
 arch:
@@ -26,10 +26,9 @@ host_network: false
 
 options:
   host_networking: false
-  curseforge_api_key: ""
 schema:
   host_networking: bool
-  curseforge_api_key: password
+  curseforge_api_key: password?
 
 map:
   - type: share

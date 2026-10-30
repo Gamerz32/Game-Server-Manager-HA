@@ -3393,6 +3393,96 @@ def queue_java_content_change(server_id: str, content_id: str, kind: str, record
     return submit_job(server_id, f"install {kind}", apply_content)
 
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global DOCKER_ERROR, HOST_DATA_SOURCE, SHUTTING_DOWN, MAINTENANCE_TASK
+    global HOST_NETWORKING_ENABLED, GATEWAY_SECRET
+    cli = None
+    try:
+        cli = docker_client()
+        cli.ping()
+        share_source = docker_self_data_source(cli, "/share")
+        if migrate_private_data_to_share(cli):
+            HOST_DATA_SOURCE = share_source / "game_server_manager"
+        else:
+            set_data_root(LEGACY_DATA_DIR)
+            HOST_DATA_SOURCE = docker_self_data_source(cli, "/data")
+            LOG.warning("Continuing to use private /data because /share migration could not be completed safely.")
+        DOCKER_ERROR = None
+    except Exception as err:
+        DOCKER_ERROR = DOCKER_UNAVAILABLE_MESSAGE
+        if _storage_entries(LEGACY_DATA_DIR):
+            set_data_root(LEGACY_DATA_DIR)
+            LOG.error("Could not prepare /share/game_server_manager; keeping existing files in /data: %s", err)
+            try:
+                HOST_DATA_SOURCE = docker_self_data_source(cli, "/data") if cli is not None else None
+            except Exception:
+                HOST_DATA_SOURCE = None
+        else:
+            set_data_root(SHARE_DATA_DIR)
+            try:
+                HOST_DATA_SOURCE = (docker_self_data_source(cli, "/share") / "game_server_manager") if cli is not None else None
+            except Exception:
+                HOST_DATA_SOURCE = None
+
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    SERVERS_DIR.mkdir(parents=True, exist_ok=True)
+    scrub_legacy_settings()
+    HOST_NETWORKING_ENABLED = bool(read_json(OPTIONS_FILE, {}).get("host_networking", False))
+    GATEWAY_SECRET = secrets.token_hex(32)
+    try:
+        import_legacy_server()
+    except Exception:
+        LOG.exception("Could not import legacy server data; original files were left untouched.")
+    try:
+        if cli is None:
+            raise RuntimeError("Docker Engine is unavailable or app storage is not mounted.")
+        ensure_minecraft_network(cli)
+        await start_gateway_relay()
+        configs = all_configs()
+        cleanup_stale_gateways({str(item["id"]) for item in configs})
+        for item in configs:
+            try:
+                await ensure_game_networking(item["id"])
+            except OSError:
+                LOG.exception("Could not start Minecraft gateway for %s", item.get("name"))
+            if item.get("desired_state") == "running" and not item.get("force_stopped"):
+                submit_job(item["id"], "resume", lambda sid=item["id"]: ensure_running(sid))
+    except Exception as err:
+        DOCKER_ERROR = DOCKER_UNAVAILABLE_MESSAGE
+        LOG.error("Docker Engine is unavailable or required game networking could not start: %s", err)
+    MAINTENANCE_TASK = asyncio.create_task(maintenance_loop())
+    yield
+    SHUTTING_DOWN = True
+    if MAINTENANCE_TASK:
+        MAINTENANCE_TASK.cancel()
+        try:
+            await MAINTENANCE_TASK
+        except asyncio.CancelledError:
+            pass
+    for server_id in list(GATEWAYS):
+        try:
+            await close_gateway(server_id)
+        except Exception:
+            LOG.exception("Could not stop gateway container for server %s", server_id)
+    await stop_gateway_relay()
+    POOL.shutdown(wait=True, cancel_futures=True)
+    try:
+        ids = [x["id"] for x in all_configs()]
+        with ThreadPoolExecutor(max_workers=max(1, min(len(ids), 16))) as pool:
+            futures = [pool.submit(stop_container, sid, False, 120) for sid in ids]
+            for future in futures:
+                try:
+                    future.result(timeout=250)
+                except Exception:
+                    LOG.exception("A game server did not stop cleanly")
+    except Exception:
+        LOG.exception("Failed while stopping managed game servers")
+
+
+app = FastAPI(title="Game Server Manager", lifespan=lifespan)
+app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+
 @app.post("/api/servers/{server_id}/content/{kind}")
 async def install_catalog_content(server_id: str, kind: str, payload: dict[str, Any]):
     if kind not in CATALOG_CONTENT_KINDS:
@@ -3547,95 +3637,6 @@ async def remove_installed_content(server_id: str, content_id: str):
     return {"server": public_server(read_json(config_path(server_id))), "job_id": job_id}
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    global DOCKER_ERROR, HOST_DATA_SOURCE, SHUTTING_DOWN, MAINTENANCE_TASK
-    global HOST_NETWORKING_ENABLED, GATEWAY_SECRET
-    cli = None
-    try:
-        cli = docker_client()
-        cli.ping()
-        share_source = docker_self_data_source(cli, "/share")
-        if migrate_private_data_to_share(cli):
-            HOST_DATA_SOURCE = share_source / "game_server_manager"
-        else:
-            set_data_root(LEGACY_DATA_DIR)
-            HOST_DATA_SOURCE = docker_self_data_source(cli, "/data")
-            LOG.warning("Continuing to use private /data because /share migration could not be completed safely.")
-        DOCKER_ERROR = None
-    except Exception as err:
-        DOCKER_ERROR = DOCKER_UNAVAILABLE_MESSAGE
-        if _storage_entries(LEGACY_DATA_DIR):
-            set_data_root(LEGACY_DATA_DIR)
-            LOG.error("Could not prepare /share/game_server_manager; keeping existing files in /data: %s", err)
-            try:
-                HOST_DATA_SOURCE = docker_self_data_source(cli, "/data") if cli is not None else None
-            except Exception:
-                HOST_DATA_SOURCE = None
-        else:
-            set_data_root(SHARE_DATA_DIR)
-            try:
-                HOST_DATA_SOURCE = (docker_self_data_source(cli, "/share") / "game_server_manager") if cli is not None else None
-            except Exception:
-                HOST_DATA_SOURCE = None
-
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
-    SERVERS_DIR.mkdir(parents=True, exist_ok=True)
-    scrub_legacy_settings()
-    HOST_NETWORKING_ENABLED = bool(read_json(OPTIONS_FILE, {}).get("host_networking", False))
-    GATEWAY_SECRET = secrets.token_hex(32)
-    try:
-        import_legacy_server()
-    except Exception:
-        LOG.exception("Could not import legacy server data; original files were left untouched.")
-    try:
-        if cli is None:
-            raise RuntimeError("Docker Engine is unavailable or app storage is not mounted.")
-        ensure_minecraft_network(cli)
-        await start_gateway_relay()
-        configs = all_configs()
-        cleanup_stale_gateways({str(item["id"]) for item in configs})
-        for item in configs:
-            try:
-                await ensure_game_networking(item["id"])
-            except OSError:
-                LOG.exception("Could not start Minecraft gateway for %s", item.get("name"))
-            if item.get("desired_state") == "running" and not item.get("force_stopped"):
-                submit_job(item["id"], "resume", lambda sid=item["id"]: ensure_running(sid))
-    except Exception as err:
-        DOCKER_ERROR = DOCKER_UNAVAILABLE_MESSAGE
-        LOG.error("Docker Engine is unavailable or required game networking could not start: %s", err)
-    MAINTENANCE_TASK = asyncio.create_task(maintenance_loop())
-    yield
-    SHUTTING_DOWN = True
-    if MAINTENANCE_TASK:
-        MAINTENANCE_TASK.cancel()
-        try:
-            await MAINTENANCE_TASK
-        except asyncio.CancelledError:
-            pass
-    for server_id in list(GATEWAYS):
-        try:
-            await close_gateway(server_id)
-        except Exception:
-            LOG.exception("Could not stop gateway container for server %s", server_id)
-    await stop_gateway_relay()
-    POOL.shutdown(wait=True, cancel_futures=True)
-    try:
-        ids = [x["id"] for x in all_configs()]
-        with ThreadPoolExecutor(max_workers=max(1, min(len(ids), 16))) as pool:
-            futures = [pool.submit(stop_container, sid, False, 120) for sid in ids]
-            for future in futures:
-                try:
-                    future.result(timeout=250)
-                except Exception:
-                    LOG.exception("A game server did not stop cleanly")
-    except Exception:
-        LOG.exception("Failed while stopping managed game servers")
-
-
-app = FastAPI(title="Game Server Manager", lifespan=lifespan)
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
 
 @app.middleware("http")

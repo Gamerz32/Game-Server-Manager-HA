@@ -15,7 +15,7 @@ Java servers run in their own [itzg/minecraft-server](https://docker-minecraft-s
 - Reset a server world from Settings, or upload a Java server-list icon.
 - Browse Bedrock add-ons on CurseForge or upload local `.mcaddon` and `.mcpack` files for a Bedrock Dedicated Server.
 - Choose Vanilla, supported server software, or a Modrinth or CurseForge modpack and version.
-- Use the Types, Mods, Plugins, and Add-ons tabs to browse compatible content; Hangar is the default plugin catalog for Paper, with Modrinth and CurseForge available as alternatives.
+- Use the Types, Mods, Plugins, and Add-ons tabs to browse compatible content; Paper cross-play servers default to Hangar for plugins; other Java servers default to Modrinth, with CurseForge and Hangar available where supported.
 - Use **Force exit** to cancel queued operations, disable Docker restart retries, and immediately remove the container if a server is stuck booting or restarting. It preserves the files in `/share`; choose Start to create a new container when you are ready.
 - Configure per-server automation for pausing or stopping idle servers, waking them on a connection attempt, and checking for updates.
 - Install updates manually, or enable each server's automatic update policy.

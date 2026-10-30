@@ -2527,7 +2527,7 @@ def clean_description(value: str) -> str:
 
 
 def modrinth_headers() -> dict[str, str]:
-    return {"User-Agent": "Gamerz32/Home-Assistant-Gameservers-ADDONS/3.0.0 (Home Assistant app)"}
+    return {"User-Agent": "Gamerz32/Home-Assistant-Gameservers-ADDONS/3.0.1 (Home Assistant app)"}
 
 
 def modrinth_author_links(team_members: Any) -> list[dict[str, str]]:

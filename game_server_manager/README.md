@@ -62,7 +62,7 @@ A pack, loader, or server type change can make an existing world or installed co
 
 ## Content catalogs and local imports
 
-The Content tab browses compatible Modrinth and CurseForge resource packs, data packs, and worlds/maps. Paper's Plugins tab defaults to Hangar and offers Modrinth and CurseForge too. The Mods tab includes an external Planet Minecraft link; downloaded mods can be imported as JAR files. Planet Minecraft links for maps, data packs, and resource packs open the relevant site category. Planet Minecraft downloads are imported manually; the add-on does not scrape the site or install from it automatically. Planet Minecraft is not offered for modpacks.
+The Content tab browses compatible Modrinth and CurseForge resource packs, data packs, and worlds/maps. Paper's Plugins tab defaults to Hangar and offers Modrinth and CurseForge too. The Mods tab includes a local JAR import area. Resource packs, data packs, and maps can also be imported from local ZIP files.
 
 Each catalog location also has a local import area. Drop modpack archives in Types, .jar files in Mods or Plugins, .mcaddon/.mcpack files in Add-ons, and .zip files for worlds, data packs, or resource packs in Content. These files are checked before installation. Installed archives are available to download from the Content library.
 

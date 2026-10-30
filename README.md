@@ -23,7 +23,7 @@ Java servers run in their own [itzg/minecraft-server](https://docker-minecraft-s
 
 ## Content catalogs and local imports
 
-The dashboard can browse and install compatible Modrinth and CurseForge resource packs, data packs, and worlds/maps. Paper plugin browsing includes Hangar, while the Mods tab also links to Planet Minecraft. Planet Minecraft is an external browse-and-download link; import downloaded .jar or .zip files through the matching tab. It is not used for modpacks.
+The dashboard can browse and install compatible Modrinth and CurseForge resource packs, data packs, and worlds/maps. Paper plugin browsing includes Hangar, while the Mods tab also supports local JAR imports.
 
 Drop supported local files into the matching import area: modpack archives in Types, mod JARs in Mods, plugin JARs in Plugins, Bedrock .mcaddon or .mcpack files in Add-ons, and resource-pack/data-pack/map ZIPs in Content. The add-on saves server files and downloaded content under /share/game_server_manager/servers/. World imports back up the previous world first.
 

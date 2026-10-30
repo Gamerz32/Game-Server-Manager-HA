@@ -115,6 +115,11 @@
 .catalog-view-button{min-width:34px;min-height:32px;padding:0 7px;border:0;border-radius:6px;background:transparent;color:#9ca3a7;font-size:18px;line-height:1}
 .catalog-view-button:hover{background:#25292c;color:#e9edef}
 .catalog-view-button.selected{background:#303538;color:#f1f4f5}
+.catalog-pagination{display:flex;align-items:center;justify-content:space-between;gap:12px;min-height:52px;margin:10px 0 22px;padding:7px 2px}
+.catalog-page-status{color:var(--muted);font-size:12px}
+.catalog-page-actions{display:flex;align-items:center;gap:8px}
+.catalog-page-actions .small-button{min-width:86px}
+.catalog-page-actions .small-button:disabled{cursor:default;opacity:.45}
 .catalog-list{overflow:hidden;border:1px solid #35393c;border-radius:12px;background:#191b1d}
 .catalog-list-row{display:grid;width:100%;grid-template-columns:44px minmax(0,1fr) minmax(160px,auto);align-items:center;gap:13px;min-height:70px;padding:9px 13px;border:0;border-bottom:1px solid #303437;border-radius:0;background:transparent;color:var(--text);text-align:left;transition:background .14s}
 .catalog-list-row:last-child{border-bottom:0}
@@ -133,6 +138,7 @@
 .catalog-toolbar .search-input{flex:1 1 100%}
 .catalog-sort-label{flex:1 1 auto}
 .catalog-sort{flex:1;width:auto}
+.catalog-pagination{align-items:flex-start;flex-direction:column;padding:8px 0}
 .catalog-list-row{grid-template-columns:42px minmax(0,1fr);gap:10px}
 .catalog-list-meta{grid-column:2;align-items:flex-start;flex-direction:row;flex-wrap:wrap}
 .provider-button{width:42px;min-width:42px;min-height:40px;padding:4px}

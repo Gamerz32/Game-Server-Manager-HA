@@ -34,7 +34,7 @@ Report vulnerabilities privately and avoid public exploit details before a fix o
 
 ## Source code and updates
 
-This repository contains the editable Game Server Manager application. The installable Home Assistant app entry is maintained in [Gamerz32/Game-Server-Manager-HA](https://github.com/Gamerz32/Game-Server-Manager-HA), which builds the app from this repository's main branch.
+This repository contains the editable Game Server Manager application. The installable Home Assistant app entry is maintained in [Gamerz32/Gamerz32-HA-Apps](https://github.com/Gamerz32/Gamerz32-HA-Apps), which builds the app from this repository's main branch.
 
 After changing the source here, bump the version in game_server_manager/config.yaml in the app-store repository and update the installed app in Home Assistant. That rebuild downloads the new source. GitHub and Python package index access are required during the build.
 
@@ -43,14 +43,14 @@ After changing the source here, bump the version in game_server_manager/config.y
 1. In Home Assistant, open **Settings → Apps → App Store → Repositories**.
 2. Add the **Gamerz32 Home Assistant Apps** repository:
 
-   `https://github.com/Gamerz32/Game-Server-Manager-HA`
+   `https://github.com/Gamerz32/Gamerz32-HA-Apps`
 
 3. Install **Game Server Manager** from the app store.
 4. In the app's configuration, set the gateway networking option as desired. It is off by default; Home Assistant restarts the app when this setting changes.
 5. Enable Docker API access and turn off Protection mode for the app, then start it.
 6. Open the app's web interface, accept the Minecraft EULA for the edition you choose, and create your first server.
 
-For detailed setup, networking, backup, migration, and troubleshooting instructions, see the [Game Server Manager guide](https://github.com/Gamerz32/Game-Server-Manager-HA/blob/main/game_server_manager/README.md).
+For detailed setup, networking, backup, migration, and troubleshooting instructions, see the [Game Server Manager guide](https://github.com/Gamerz32/Gamerz32-HA-Apps/blob/main/game_server_manager/README.md).
 
 ## Docker access and networking
 

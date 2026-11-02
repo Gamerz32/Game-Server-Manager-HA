@@ -28,6 +28,10 @@ The dashboard can browse and install compatible Modrinth and CurseForge resource
 Drop supported local files into the matching import area: modpack archives in Types, mod JARs in Mods, plugin JARs in Plugins, Bedrock .mcaddon or .mcpack files in Add-ons, and resource-pack/data-pack/map ZIPs in Content. The add-on saves server files and downloaded content under /share/game_server_manager/servers/. World imports back up the previous world first.
 
 CurseForge uses an API key configured in the Home Assistant add-on Configuration. A temporary session override is available under Catalog Settings. Resource packs installed by the add-on are downloadable from the manager; Minecraft clients need the ZIP at a public HTTPS URL, configured in that Java server's Settings.
+## Security reporting
+
+Report vulnerabilities privately and avoid public exploit details before a fix or mitigation is available. See the [security policy](SECURITY.md).
+
 ## Source code and updates
 
 This repository contains the editable Game Server Manager application. The installable Home Assistant app entry is maintained in [Gamerz32/Game-Server-Manager-HA](https://github.com/Gamerz32/Game-Server-Manager-HA), which builds the app from this repository's main branch.
